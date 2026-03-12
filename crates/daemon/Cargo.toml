@@ -20,6 +20,7 @@ cuda = ["model/cuda"]
 channel.workspace = true
 model.workspace = true
 socket.workspace = true
+tcp.workspace = true
 wcore.workspace = true
 
 # crates.io
