@@ -7,6 +7,7 @@ use compact_str::CompactString;
 use std::path::PathBuf;
 
 pub mod attach;
+pub mod auth;
 #[cfg(feature = "daemon")]
 pub mod daemon;
 pub mod hub;
@@ -35,7 +36,7 @@ pub struct Cli {
 impl Cli {
     /// Resolve the agent name from CLI flags or fall back to "assistant".
     pub fn resolve_agent(&self) -> CompactString {
-        self.agent.clone().unwrap_or_else(|| "Walrus".into())
+        self.agent.clone().unwrap_or_else(|| "walrus".into())
     }
 
     /// Resolve the socket path from CLI flag or default.
@@ -50,6 +51,7 @@ impl Cli {
         let agent = self.resolve_agent();
         let socket_path = self.resolve_socket();
         match self.command {
+            Command::Auth(cmd) => cmd.run(),
             Command::Attach(cmd) => {
                 let runner = connect(&socket_path).await?;
                 cmd.run(runner, agent).await
@@ -79,6 +81,8 @@ impl Cli {
 pub enum Command {
     /// Attach to an agent via the interactive chat REPL.
     Attach(attach::Attach),
+    /// Configure channel API tokens interactively.
+    Auth(auth::Auth),
     /// Install or uninstall hub packages.
     Hub(hub::Hub),
     /// Manage local models.
