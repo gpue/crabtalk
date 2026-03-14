@@ -61,7 +61,7 @@ impl ProviderManager {
         if configs.is_empty() {
             bail!("at least one provider config is required");
         }
-        let manager = Self::new(configs[0].model.clone());
+        let manager = Self::new(configs[0].name.clone());
         for config in configs {
             manager.add_config(config).await?;
         }
@@ -93,7 +93,7 @@ impl ProviderManager {
             .inner
             .write()
             .map_err(|_| anyhow!("provider lock poisoned"))?;
-        inner.providers.insert(config.model.clone(), provider);
+        inner.providers.insert(config.name.clone(), provider);
         Ok(())
     }
 
@@ -175,28 +175,10 @@ impl ProviderManager {
             .ok_or_else(|| anyhow!("model '{}' not found in registry", model))
     }
 
-    /// Wait until the active provider is ready.
-    ///
-    /// No-op for remote providers. For local providers, blocks until the
-    /// model finishes loading.
-    pub async fn wait_until_ready(&self) -> Result<()> {
-        let mut provider = self.active()?;
-        provider.wait_until_ready().await
-    }
-
     /// Resolve the context limit for a model.
     ///
-    /// Resolution chain: provider reports limit → static map → 8192 default.
-    /// Falls back to the static default if the lock is poisoned.
+    /// Uses the static map in `wcore::model::default_context_limit`.
     pub fn context_limit(&self, model: &str) -> usize {
-        let Ok(inner) = self.inner.read() else {
-            return default_context_limit(model);
-        };
-        if let Some(provider) = inner.providers.get(model)
-            && let Some(limit) = provider.context_length(model)
-        {
-            return limit;
-        }
         default_context_limit(model)
     }
 }
