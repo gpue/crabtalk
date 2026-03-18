@@ -3,9 +3,9 @@
 pub use crate::hook::{
     mcp::McpServerConfig,
     os::{PermissionConfig, ToolPermission},
-    task::TasksConfig,
+    system::SystemConfig,
 };
-pub use ::model::{ModelConfig, ProviderDef, ProviderManager};
+pub use ::model::{ModelConfig, ProviderDef, ProviderRegistry};
 use anyhow::Result;
 use compact_str::CompactString;
 pub use loader::{load_agents_dir, scaffold_config_dir};
@@ -21,9 +21,6 @@ mod loader;
 /// Top-level daemon configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DaemonConfig {
-    /// The walrus daemon's own agent config (model, heartbeat).
-    #[serde(default)]
-    pub walrus: AgentConfig,
     /// Provider definitions (`[provider.<name>]`).
     #[serde(default)]
     pub provider: BTreeMap<CompactString, ProviderDef>,
@@ -33,9 +30,9 @@ pub struct DaemonConfig {
     /// MCP server configurations.
     #[serde(default)]
     pub mcps: BTreeMap<String, McpServerConfig>,
-    /// Task executor pool configuration.
+    /// System configuration (tasks + memory).
     #[serde(default)]
-    pub tasks: TasksConfig,
+    pub system: SystemConfig,
     /// Per-agent configurations (name → config).
     #[serde(default)]
     pub agents: BTreeMap<String, AgentConfig>,
@@ -56,8 +53,8 @@ impl DaemonConfig {
                 server.name = name.clone().into();
             }
         });
-        if config.walrus.model.is_none() {
-            config.walrus.model = Some(::model::default_model().into());
+        if config.system.walrus.model.is_none() {
+            config.system.walrus.model = Some(::model::default_model().into());
         }
         ModelConfig::validate(&config.provider)?;
         Ok(config)

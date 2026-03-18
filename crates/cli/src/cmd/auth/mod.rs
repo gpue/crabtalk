@@ -41,22 +41,22 @@ pub(crate) struct Preset {
 pub(crate) const PRESETS: &[Preset] = &[
     Preset {
         name: "anthropic",
-        base_url: "https://api.anthropic.com/v1/messages",
+        base_url: "",
         standard: "anthropic",
     },
     Preset {
         name: "openai",
-        base_url: "https://api.openai.com/v1/chat/completions",
+        base_url: "https://api.openai.com/v1",
         standard: "openai",
     },
     Preset {
         name: "deepseek",
-        base_url: "https://api.deepseek.com/v1/chat/completions",
+        base_url: "https://api.deepseek.com/v1",
         standard: "openai",
     },
     Preset {
         name: "ollama",
-        base_url: "http://localhost:11434/v1/chat/completions",
+        base_url: "http://localhost:11434/v1",
         standard: "openai",
     },
     Preset {
@@ -288,13 +288,18 @@ impl AuthState {
             .parse()
             .with_context(|| format!("invalid TOML in {}", config_path.display()))?;
 
-        // [walrus].model
+        // [system.walrus].model
         if !self.active_model.is_empty() {
-            if doc.get("walrus").is_none() {
-                doc.insert("walrus", Item::Table(Table::new()));
+            if doc.get("system").is_none() {
+                doc.insert("system", Item::Table(Table::new()));
             }
-            if let Some(walrus) = doc.get_mut("walrus").and_then(|w| w.as_table_mut()) {
-                walrus.insert("model", value(&self.active_model));
+            if let Some(system) = doc.get_mut("system").and_then(|s| s.as_table_mut()) {
+                if system.get("walrus").is_none() {
+                    system.insert("walrus", Item::Table(Table::new()));
+                }
+                if let Some(walrus) = system.get_mut("walrus").and_then(|w| w.as_table_mut()) {
+                    walrus.insert("model", value(&self.active_model));
+                }
             }
         }
 

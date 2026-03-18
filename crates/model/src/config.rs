@@ -12,7 +12,7 @@ pub use wcore::config::provider::{ApiStandard, ProviderDef};
 /// Model configuration for the daemon.
 ///
 /// Providers are configured as `[provider.<name>]` sections, each owning
-/// a list of model names. The active model name lives in `[walrus].model`.
+/// a list of model names. The active model name lives in `[system.walrus].model`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ModelConfig {
     /// Optional embedding model.
@@ -25,7 +25,7 @@ impl ModelConfig {
     pub fn validate(providers: &BTreeMap<CompactString, ProviderDef>) -> Result<()> {
         let mut seen = HashSet::new();
         for (name, def) in providers {
-            def.validate(name)?;
+            def.validate(name).map_err(|e| anyhow::anyhow!(e))?;
             for model in &def.models {
                 if !seen.insert(model.clone()) {
                     bail!("duplicate model name '{model}' across providers");

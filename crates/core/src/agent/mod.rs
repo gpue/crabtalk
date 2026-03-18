@@ -235,7 +235,7 @@ impl<M: Model> Agent<M> {
                                     yield AgentEvent::ThinkingDelta(reason.to_owned());
                                 }
                                 if let Some(r) = chunk.reason() {
-                                    finish_reason = Some(*r);
+                                    finish_reason = Some(r.clone());
                                 }
                                 last_meta = chunk.meta.clone();
                                 if chunk.usage.is_some() {
@@ -328,6 +328,7 @@ impl<M: Model> Agent<M> {
                     && Self::estimate_tokens(history) > threshold
                 {
                     if let Some(summary) = self.compact(history).await {
+                        yield AgentEvent::Compact { summary: summary.clone() };
                         *history = vec![Message::user(&summary)];
                         yield AgentEvent::TextDelta(
                             "\n[context compacted]\n".to_owned(),

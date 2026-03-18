@@ -12,14 +12,12 @@ use crate::{
 };
 use ::socket::server::accept_loop;
 use anyhow::Result;
-use model::ProviderManager;
+use model::ProviderRegistry;
 use std::{
-    collections::BTreeMap,
     path::{Path, PathBuf},
     sync::Arc,
 };
 use tokio::sync::{RwLock, broadcast, mpsc, oneshot};
-use wcore::AgentConfig;
 use wcore::Runtime;
 
 pub(crate) mod builder;
@@ -34,15 +32,13 @@ mod protocol;
 #[derive(Clone)]
 pub struct Daemon {
     /// The walrus runtime, swappable via [`Daemon::reload`].
-    pub runtime: Arc<RwLock<Arc<Runtime<ProviderManager, DaemonHook>>>>,
+    pub runtime: Arc<RwLock<Arc<Runtime<ProviderRegistry, DaemonHook>>>>,
     /// Config directory — stored so [`Daemon::reload`] can re-read config from disk.
     pub(crate) config_dir: PathBuf,
     /// Sender for the daemon event loop — cloned into `Runtime` as `ToolSender`
     /// so agents can dispatch tool calls. Stored here so [`Daemon::reload`] can
     /// pass a fresh clone into the rebuilt runtime.
     pub(crate) event_tx: DaemonEventSender,
-    /// Per-agent configurations (name → config).
-    pub(crate) agents_config: BTreeMap<String, AgentConfig>,
 }
 
 impl Daemon {

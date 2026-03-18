@@ -3,7 +3,7 @@
 use crate::service::config::{ServiceConfig, ServiceKind};
 use anyhow::{Context, Result, bail};
 use compact_str::CompactString;
-use model::ProviderManager;
+use model::ProviderRegistry;
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
@@ -17,16 +17,16 @@ use tokio::{
 };
 use wcore::{
     AgentConfig, CompactHook, Hook, ToolRegistry,
-    model::{Message, Model, Request, Role, Tool},
+    model::{Message, Model, Request, Tool},
     protocol::{
         PROTOCOL_VERSION,
         codec::{read_message, write_message},
         ext::{
-            Capability, ExtAfterRun, ExtBeforeRun, ExtBeforeRunResult, ExtBuildAgent,
-            ExtBuildAgentResult, ExtCompact, ExtCompactResult, ExtConfigure, ExtConfigured,
-            ExtError, ExtEvent, ExtHello, ExtInferResult, ExtReady, ExtRegisterTools, ExtRequest,
-            ExtResponse, ExtToolCall, ExtToolResult, ExtToolSchemas, SimpleMessage, ToolsList,
-            capability, ext_request, ext_response,
+            Capability, ExtAfterCompact, ExtAfterRun, ExtBeforeRun, ExtBeforeRunResult,
+            ExtBuildAgent, ExtBuildAgentResult, ExtCompact, ExtCompactResult, ExtConfigure,
+            ExtConfigured, ExtError, ExtEvent, ExtHello, ExtInferResult, ExtReady,
+            ExtRegisterTools, ExtRequest, ExtResponse, ExtToolCall, ExtToolResult, ExtToolSchemas,
+            SimpleMessage, ToolsList, capability, ext_request, ext_response,
         },
     },
 };
@@ -81,13 +81,15 @@ pub struct ServiceRegistry {
     pub event_observer: Vec<Arc<ServiceHandle>>,
     /// Services that declared AfterRun capability.
     pub after_run: Vec<Arc<ServiceHandle>>,
+    /// Services that declared AfterCompact capability.
+    pub after_compact: Vec<Arc<ServiceHandle>>,
     /// Model for Infer fulfillment (set after runtime construction).
-    model: Option<ProviderManager>,
+    model: Option<ProviderRegistry>,
 }
 
 impl ServiceRegistry {
     /// Set the model for Infer fulfillment.
-    pub fn set_model(&mut self, model: ProviderManager) {
+    pub fn set_model(&mut self, model: ProviderRegistry) {
         self.model = Some(model);
     }
 
@@ -379,6 +381,47 @@ impl Hook for ServiceRegistry {
         }
     }
 
+    fn on_after_compact(&self, agent: &str, summary: &str) {
+        if self.after_compact.is_empty() {
+            return;
+        }
+        let agent = agent.to_owned();
+        let summary = summary.to_owned();
+        for handle in &self.after_compact {
+            let handle = Arc::clone(handle);
+            let agent = agent.clone();
+            let summary = summary.clone();
+            tokio::spawn(async move {
+                let req = ExtRequest {
+                    msg: Some(ext_request::Msg::AfterCompact(ExtAfterCompact {
+                        agent: agent.clone(),
+                        summary,
+                    })),
+                };
+                if let Some(resp) = send_with_timeout(&handle, &req, 30, "AfterCompact").await {
+                    match resp.msg {
+                        Some(ext_response::Msg::AfterCompactResult(_)) => {
+                            tracing::debug!(service = %handle.name, %agent, "AfterCompact complete");
+                        }
+                        Some(ext_response::Msg::Error(ExtError { message })) => {
+                            tracing::warn!(
+                                service = %handle.name,
+                                error = %message,
+                                "AfterCompact service error"
+                            );
+                        }
+                        other => {
+                            tracing::warn!(
+                                service = %handle.name,
+                                "unexpected AfterCompact response: {other:?}"
+                            );
+                        }
+                    }
+                }
+            });
+        }
+    }
+
     async fn on_register_tools(&self, tools: &mut ToolRegistry) {
         tools.insert_all(self.tool_schemas.clone());
     }
@@ -395,12 +438,7 @@ fn to_simple_messages(history: &[Message]) -> Vec<SimpleMessage> {
     history
         .iter()
         .map(|m| SimpleMessage {
-            role: match m.role {
-                Role::User => "user".to_owned(),
-                Role::Assistant => "assistant".to_owned(),
-                Role::System => "system".to_owned(),
-                Role::Tool => "tool".to_owned(),
-            },
+            role: m.role.as_str().to_owned(),
             content: m.content.clone(),
         })
         .collect()
@@ -412,7 +450,7 @@ fn to_simple_messages(history: &[Message]) -> Vec<SimpleMessage> {
 /// model and system prompt, auto-attaches service's tools, loops until final text.
 /// Tool calls are dispatched back to the owning service.
 async fn infer_fulfill(
-    model: &ProviderManager,
+    model: &ProviderRegistry,
     handle: &ServiceHandle,
     agent: &str,
     system_prompt: &str,
@@ -841,6 +879,9 @@ impl ServiceManager {
                 }
                 Some(capability::Cap::AfterRun(_)) => {
                     registry.after_run.push(Arc::clone(handle));
+                }
+                Some(capability::Cap::AfterCompact(_)) => {
+                    registry.after_compact.push(Arc::clone(handle));
                 }
                 Some(capability::Cap::Infer(_)) => {
                     // Response-side capability — not stored in registry.

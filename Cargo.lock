@@ -1521,6 +1521,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "crabtalk-core"
+version = "0.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c029270a19a4260515dce195f546aff4e420279912def5201ad9c0c74b15c69c"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "crabtalk-provider"
+version = "0.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7c02f4fb474085cdb08dabfafdc480206dbd83ce3d6496051382f0bbd116aba1"
+dependencies = [
+ "bytes",
+ "crabtalk-core",
+ "futures",
+ "rand 0.9.2",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "crc32c"
 version = "0.6.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5618,7 +5644,7 @@ dependencies = [
 
 [[package]]
 name = "openwalrus"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -8714,11 +8740,12 @@ dependencies = [
 
 [[package]]
 name = "walrus-core"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "anyhow",
  "async-stream",
  "compact_str 0.8.1",
+ "crabtalk-core",
  "dirs",
  "futures-core",
  "futures-util",
@@ -8734,7 +8761,7 @@ dependencies = [
 
 [[package]]
 name = "walrus-daemon"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -8760,7 +8787,7 @@ dependencies = [
 
 [[package]]
 name = "walrus-discord"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "anyhow",
  "clap",
@@ -8776,7 +8803,7 @@ dependencies = [
 
 [[package]]
 name = "walrus-gateway"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "anyhow",
  "compact_str 0.8.1",
@@ -8791,7 +8818,7 @@ dependencies = [
 
 [[package]]
 name = "walrus-memory"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -8818,13 +8845,16 @@ dependencies = [
 
 [[package]]
 name = "walrus-model"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "anyhow",
  "async-stream",
  "compact_str 0.8.1",
+ "crabtalk-core",
+ "crabtalk-provider",
  "futures-core",
  "futures-util",
+ "rand 0.9.2",
  "reqwest",
  "serde",
  "serde_json",
@@ -8835,7 +8865,7 @@ dependencies = [
 
 [[package]]
 name = "walrus-search"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "anyhow",
  "clap",
@@ -8859,7 +8889,7 @@ dependencies = [
 
 [[package]]
 name = "walrus-socket"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -8871,7 +8901,7 @@ dependencies = [
 
 [[package]]
 name = "walrus-tcp"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -8883,7 +8913,7 @@ dependencies = [
 
 [[package]]
 name = "walrus-telegram"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "anyhow",
  "clap",

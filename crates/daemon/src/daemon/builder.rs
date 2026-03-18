@@ -9,17 +9,21 @@ use crate::{
     Daemon, DaemonConfig,
     daemon::event::{DaemonEvent, DaemonEventSender},
     ext::hub::DownloadRegistry,
-    hook::{self, DaemonHook, task::TaskRegistry},
+    hook::{
+        self, DaemonHook,
+        system::{memory::BuiltinMemory, task::TaskRegistry},
+    },
     service::ServiceManager,
 };
 use anyhow::Result;
 use compact_str::CompactString;
-use model::ProviderManager;
+use model::ProviderRegistry;
 use std::{path::Path, sync::Arc};
 use tokio::sync::{Mutex, RwLock};
 use wcore::{AgentConfig, Runtime, ToolRequest};
 
 const SYSTEM_AGENT: &str = include_str!("../../prompts/walrus.md");
+const SKILL_MASTER_AGENT: &str = include_str!("../../prompts/skill-master.md");
 
 impl Daemon {
     /// Build a fully-configured [`Daemon`] from the given config, config
@@ -36,7 +40,6 @@ impl Daemon {
                 runtime: Arc::new(RwLock::new(Arc::new(runtime))),
                 config_dir: config_dir.to_path_buf(),
                 event_tx,
-                agents_config: config.agents.clone(),
             },
             service_manager,
         ))
@@ -64,8 +67,11 @@ impl Daemon {
         config: &DaemonConfig,
         config_dir: &Path,
         event_tx: &DaemonEventSender,
-    ) -> Result<(Runtime<ProviderManager, DaemonHook>, Option<ServiceManager>)> {
-        let manager = Self::build_providers(config).await?;
+    ) -> Result<(
+        Runtime<ProviderRegistry, DaemonHook>,
+        Option<ServiceManager>,
+    )> {
+        let manager = Self::build_providers(config)?;
         let (hook, service_manager) =
             Self::build_hook(config, config_dir, event_tx, &manager).await?;
         let tool_tx = Self::build_tool_sender(event_tx);
@@ -78,32 +84,33 @@ impl Daemon {
         Ok((runtime, service_manager))
     }
 
-    /// Construct the provider manager from config.
+    /// Construct the provider registry from config.
     ///
     /// Builds remote providers from config and sets the active model.
-    async fn build_providers(config: &DaemonConfig) -> Result<ProviderManager> {
+    fn build_providers(config: &DaemonConfig) -> Result<ProviderRegistry> {
         let active_model = config
+            .system
             .walrus
             .model
             .clone()
-            .ok_or_else(|| anyhow::anyhow!("walrus.model is required in walrus.toml"))?;
-        let manager = ProviderManager::from_providers(active_model, &config.provider).await?;
+            .ok_or_else(|| anyhow::anyhow!("system.walrus.model is required in walrus.toml"))?;
+        let registry = ProviderRegistry::from_providers(active_model, &config.provider)?;
 
         tracing::info!(
-            "provider manager initialized — active model: {}",
-            manager.active_model_name().unwrap_or_default()
+            "provider registry initialized — active model: {}",
+            registry.active_model_name().unwrap_or_default()
         );
-        Ok(manager)
+        Ok(registry)
     }
 
-    /// Build the daemon hook with all backends (skills, MCP, tasks, downloads).
-    /// Memory is handled by an external extension service.
+    /// Build the daemon hook with all backends (skills, MCP, tasks, downloads, memory).
+    /// Built-in memory is active unless the walrus-memory extension provides `recall`.
     /// Returns the hook and an optional ServiceManager for child service lifecycle.
     async fn build_hook(
         config: &DaemonConfig,
         config_dir: &Path,
         event_tx: &DaemonEventSender,
-        manager: &ProviderManager,
+        manager: &ProviderRegistry,
     ) -> Result<(DaemonHook, Option<ServiceManager>)> {
         let downloads = Arc::new(Mutex::new(DownloadRegistry::new()));
 
@@ -116,11 +123,10 @@ impl Daemon {
         let mcp_servers = config.mcps.values().cloned().collect::<Vec<_>>();
         let mcp_handler = hook::mcp::McpHandler::load(&mcp_servers).await;
 
+        let task_timeout = std::time::Duration::from_secs(config.system.tasks.task_timeout);
         let tasks = Arc::new(Mutex::new(TaskRegistry::new(
-            config.tasks.max_concurrent,
-            config.tasks.viewable_window,
-            std::time::Duration::from_secs(config.tasks.task_timeout),
-            event_tx.clone(),
+            config.system.tasks.max_concurrent,
+            config.system.tasks.viewable_window,
         )));
 
         let sandboxed = detect_sandbox();
@@ -141,6 +147,19 @@ impl Daemon {
             (Some(Arc::new(registry)), Some(sm))
         };
 
+        // Construct built-in memory unless the walrus-memory extension provides "recall".
+        let has_ext_memory = registry
+            .as_ref()
+            .is_some_and(|r| r.tools.contains_key("recall"));
+        let memory = if !has_ext_memory {
+            Some(BuiltinMemory::open(
+                config_dir.join("memory"),
+                config.system.memory.clone(),
+            ))
+        } else {
+            None
+        };
+
         Ok((
             DaemonHook::new(
                 skills,
@@ -149,7 +168,10 @@ impl Daemon {
                 downloads,
                 config.permissions.clone(),
                 sandboxed,
+                memory,
                 registry,
+                event_tx.clone(),
+                task_timeout,
             ),
             service_manager,
         ))
@@ -179,7 +201,7 @@ impl Daemon {
     /// loaded by iterating TOML `[agents.*]` entries and matching each to a
     /// `.md` prompt file from the agents directory.
     fn load_agents(
-        runtime: &mut Runtime<ProviderManager, DaemonHook>,
+        runtime: &mut Runtime<ProviderRegistry, DaemonHook>,
         config_dir: &Path,
         config: &DaemonConfig,
     ) -> Result<()> {
@@ -188,10 +210,17 @@ impl Daemon {
         let prompt_map: std::collections::BTreeMap<String, String> = prompts.into_iter().collect();
 
         // Built-in walrus agent.
-        let mut walrus_config = config.walrus.clone();
+        let mut walrus_config = config.system.walrus.clone();
         walrus_config.name = CompactString::from(wcore::paths::DEFAULT_AGENT);
         walrus_config.system_prompt = SYSTEM_AGENT.to_owned();
         runtime.add_agent(walrus_config);
+
+        // Built-in skill-master agent.
+        let mut skill_master = AgentConfig::new("skill-master");
+        skill_master.system_prompt = SKILL_MASTER_AGENT.to_owned();
+        skill_master.description = CompactString::from("Interactive skill recorder");
+        skill_master.thinking = config.system.walrus.thinking;
+        runtime.add_agent(skill_master);
 
         // Sub-agents from TOML — each must have a matching .md file.
         for (name, agent_config) in &config.agents {
@@ -207,7 +236,7 @@ impl Daemon {
         }
 
         // Also register agents that have .md files but no TOML entry (defaults).
-        let default_think = config.walrus.thinking;
+        let default_think = config.system.walrus.thinking;
         for (stem, prompt) in &prompt_map {
             if config.agents.contains_key(stem) {
                 continue;

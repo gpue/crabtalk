@@ -8,10 +8,8 @@ use tokio::sync::{oneshot, watch};
 use tokio::task::AbortHandle;
 use tokio::time::Instant;
 
-pub use config::TasksConfig;
 pub use registry::TaskRegistry;
 
-pub mod config;
 mod registry;
 pub(crate) mod tool;
 
@@ -88,9 +86,6 @@ pub struct Task {
     pub created_at: Instant,
     /// Handle to abort the spawned execution task.
     pub abort_handle: Option<AbortHandle>,
-    /// Whether this task was created via `spawn_task` (auto-dispatched).
-    /// False for `create_task` entries (delivered by heartbeat).
-    pub spawned: bool,
     /// Watch channel for status change notifications (used by await_tasks).
     pub status_tx: watch::Sender<TaskStatus>,
 }

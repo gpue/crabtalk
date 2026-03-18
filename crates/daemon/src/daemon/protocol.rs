@@ -77,6 +77,9 @@ impl Server for Daemon {
                     AgentEvent::ToolCallsComplete => {
                         yield StreamEvent { event: Some(stream_event::Event::ToolsComplete(ToolsCompleteEvent {})) };
                     }
+                    AgentEvent::Compact { .. } => {
+                        // Compact events are handled by on_event in the hook layer.
+                    }
                     AgentEvent::Done(resp) => {
                         if let wcore::AgentStopReason::Error(e) = &resp.stop_reason {
                             if is_new {
@@ -124,24 +127,12 @@ impl Server for Daemon {
         let tasks = registry.list(None, None, None);
         Ok(tasks
             .into_iter()
-            .map(|t| TaskInfo {
-                id: t.id,
-                parent_id: t.parent_id,
-                agent: t.agent.to_string(),
-                status: t.status.to_string(),
-                description: t.description.clone(),
-                result: t.result.clone(),
-                error: t.error.clone(),
-                created_by: t.created_by.to_string(),
-                prompt_tokens: t.prompt_tokens,
-                completion_tokens: t.completion_tokens,
-                alive_secs: t.created_at.elapsed().as_secs(),
-                blocked_on: t.blocked_on.as_ref().map(|i| i.question.clone()),
-            })
+            .map(crate::hook::system::task::TaskRegistry::task_info)
             .collect())
     }
 
     async fn kill_task(&self, task_id: u64) -> Result<bool> {
+        use crate::hook::system::task::TaskStatus;
         let rt = self.runtime.read().await.clone();
         let tasks = rt.hook.tasks.clone();
         let mut registry = tasks.lock().await;
@@ -149,26 +140,23 @@ impl Server for Daemon {
             return Ok(false);
         };
         match task.status {
-            crate::hook::task::TaskStatus::InProgress | crate::hook::task::TaskStatus::Blocked => {
-                if let Some(handle) = &task.abort_handle {
-                    handle.abort();
-                }
-                registry.set_status(task_id, crate::hook::task::TaskStatus::Failed);
-                if let Some(task) = registry.get_mut(task_id) {
-                    task.error = Some("killed by user".into());
-                }
-                // Close associated session.
-                if let Some(sid) = registry.get(task_id).and_then(|t| t.session_id) {
+            TaskStatus::InProgress | TaskStatus::Blocked => {
+                let session_id = task.session_id;
+                registry.kill(task_id);
+                crate::hook::system::task::tool::try_promote(
+                    &mut registry,
+                    tasks.clone(),
+                    rt.hook.event_tx.clone(),
+                    rt.hook.task_timeout,
+                );
+                // Close associated session outside the lock.
+                if let Some(sid) = session_id {
                     drop(registry);
                     rt.close_session(sid).await;
-                    let mut registry = tasks.lock().await;
-                    registry.promote_next(tasks.clone());
-                } else {
-                    registry.promote_next(tasks.clone());
                 }
                 Ok(true)
             }
-            crate::hook::task::TaskStatus::Queued => {
+            TaskStatus::Queued => {
                 registry.remove(task_id);
                 Ok(true)
             }
@@ -364,6 +352,8 @@ impl Server for Daemon {
                 .chain(reg.before_run.iter())
                 .chain(reg.compact.iter())
                 .chain(reg.event_observer.iter())
+                .chain(reg.after_run.iter())
+                .chain(reg.after_compact.iter())
                 .chain(reg.query.values())
                 .chain(reg.tools.values())
                 .collect();
@@ -399,6 +389,9 @@ impl Server for Daemon {
                         }
                         Some(wcore::protocol::ext::capability::Cap::Infer(_)) => {
                             Some("infer".into())
+                        }
+                        Some(wcore::protocol::ext::capability::Cap::AfterCompact(_)) => {
+                            Some("after_compact".into())
                         }
                         None => None,
                     })

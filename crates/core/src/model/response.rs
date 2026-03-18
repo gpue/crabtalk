@@ -2,6 +2,7 @@
 
 use crate::model::{Message, Role, tool::ToolCall};
 use compact_str::CompactString;
+pub use crabtalk_core::{CompletionTokensDetails, FinishReason, Usage};
 use serde::{Deserialize, Serialize};
 
 /// Common metadata shared between streaming and non-streaming completions
@@ -109,55 +110,6 @@ pub struct Choice {
 
     /// Log probability information
     pub logprobs: Option<LogProbs>,
-}
-
-/// The reason the model stopped generating
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FinishReason {
-    /// The model finished naturally
-    Stop,
-
-    /// The model hit the max token limit
-    Length,
-
-    /// Content was filtered
-    ContentFilter,
-
-    /// The model is making tool calls
-    ToolCalls,
-
-    /// Insufficient system resources
-    InsufficientSystemResource,
-}
-
-/// Token usage statistics
-#[derive(Debug, Clone, Deserialize)]
-pub struct Usage {
-    /// Number of tokens in the prompt
-    pub prompt_tokens: u32,
-
-    /// Number of tokens in the completion
-    pub completion_tokens: u32,
-
-    /// Total number of tokens used
-    pub total_tokens: u32,
-
-    /// Number of prompt tokens from cache hits
-    pub prompt_cache_hit_tokens: Option<u32>,
-
-    /// Number of prompt tokens not in cache
-    pub prompt_cache_miss_tokens: Option<u32>,
-
-    /// Detailed breakdown of completion tokens
-    pub completion_tokens_details: Option<CompletionTokensDetails>,
-}
-
-/// Detailed breakdown of completion tokens
-#[derive(Debug, Clone, Deserialize)]
-pub struct CompletionTokensDetails {
-    /// Number of tokens used for reasoning
-    pub reasoning_tokens: Option<u32>,
 }
 
 /// Log probability information
