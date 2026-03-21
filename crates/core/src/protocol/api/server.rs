@@ -1,9 +1,9 @@
 //! Server trait — one async method per protocol operation.
 
 use crate::protocol::message::{
-    ClientMessage, ConfigMsg, DownloadEvent, DownloadInfo, DownloadList, ErrorMsg, HubAction, Pong,
-    SendMsg, SendResponse, ServerMessage, SessionInfo, SessionList, StreamEvent, StreamMsg,
-    client_message, server_message,
+    AgentEventMsg, ClientMessage, ConfigMsg, DownloadEvent, DownloadInfo, DownloadList, ErrorMsg,
+    HubAction, Pong, SendMsg, SendResponse, ServerMessage, SessionInfo, SessionList, StreamEvent,
+    StreamMsg, client_message, server_message,
 };
 use anyhow::Result;
 use futures_core::Stream;
@@ -74,6 +74,9 @@ pub trait Server: Sync {
     /// Handle `SubscribeDownloads` — stream download lifecycle events.
     fn subscribe_downloads(&self) -> impl Stream<Item = Result<DownloadEvent>> + Send;
 
+    /// Handle `SubscribeEvents` — stream agent events.
+    fn subscribe_events(&self) -> impl Stream<Item = Result<AgentEventMsg>> + Send;
+
     /// Handle `GetConfig` — return the full daemon config as JSON.
     fn get_config(&self) -> impl std::future::Future<Output = Result<String>> + Send;
 
@@ -82,6 +85,13 @@ pub trait Server: Sync {
 
     /// Handle `Reload` — hot-reload runtime from disk.
     fn reload(&self) -> impl std::future::Future<Output = Result<()>> + Send;
+
+    /// Handle `ReplyToAsk` — deliver a user reply to a pending `ask_user` tool call.
+    fn reply_to_ask(
+        &self,
+        session: u64,
+        content: String,
+    ) -> impl std::future::Future<Output = Result<()>> + Send;
 
     /// Dispatch a `ClientMessage` to the appropriate handler method.
     ///
@@ -166,10 +176,23 @@ pub trait Server: Sync {
                         Err(e) => server_error(500, e.to_string()),
                     };
                 }
+                client_message::Msg::SubscribeEvents(_) => {
+                    let s = self.subscribe_events();
+                    tokio::pin!(s);
+                    while let Some(result) = s.next().await {
+                        yield result_to_msg(result);
+                    }
+                }
                 client_message::Msg::Reload(_) => {
                     yield match self.reload().await {
                         Ok(()) => server_pong(),
                         Err(e) => server_error(500, e.to_string()),
+                    };
+                }
+                client_message::Msg::ReplyToAsk(msg) => {
+                    yield match self.reply_to_ask(msg.session, msg.content).await {
+                        Ok(()) => server_pong(),
+                        Err(e) => server_error(404, e.to_string()),
                     };
                 }
             }

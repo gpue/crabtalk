@@ -10,9 +10,16 @@ use crate::{
     hook::{mcp::McpHandler, skill::SkillHandler, system::memory::Memory},
 };
 use crabhub::DownloadRegistry;
-use std::{collections::BTreeMap, sync::Arc};
-use tokio::sync::Mutex;
-use wcore::{AgentConfig, AgentEvent, Hook, ToolRegistry, model::Message};
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::Arc,
+};
+use tokio::sync::{Mutex, broadcast, oneshot};
+use wcore::{
+    AgentConfig, AgentEvent, Hook, ToolRegistry,
+    model::Message,
+    protocol::message::{AgentEventKind, AgentEventMsg},
+};
 
 pub mod mcp;
 pub mod os;
@@ -42,10 +49,14 @@ pub struct DaemonHook {
     pub(crate) scopes: BTreeMap<String, AgentScope>,
     /// Sub-agent descriptions for catalog injection into the crab agent.
     pub(crate) agent_descriptions: BTreeMap<String, String>,
+    /// Broadcast channel for agent events (console subscription).
+    events_tx: broadcast::Sender<AgentEventMsg>,
+    /// Pending `ask_user` oneshots, keyed by session_id.
+    pub(crate) pending_asks: Arc<Mutex<HashMap<u64, oneshot::Sender<String>>>>,
 }
 
 /// Base tools always included in every agent's whitelist.
-const BASE_TOOLS: &[&str] = &["bash"];
+const BASE_TOOLS: &[&str] = &["bash", "ask_user"];
 
 /// Skill discovery/loading tools.
 const SKILL_TOOLS: &[&str] = &["skill"];
@@ -142,6 +153,7 @@ impl Hook for DaemonHook {
         tools.insert_all(os::tool::tools());
         tools.insert_all(skill::tool::tools());
         tools.insert_all(system::task::tool::tools());
+        tools.insert_all(system::ask_user::tools());
         if self.memory.is_some() {
             tools.insert_all(system::memory::tool::tools());
         }
@@ -153,26 +165,33 @@ impl Hook for DaemonHook {
         }
     }
 
-    fn on_event(&self, agent: &str, event: &AgentEvent) {
-        match event {
+    fn on_event(&self, agent: &str, session_id: u64, event: &AgentEvent) {
+        let (kind, content) = match event {
             AgentEvent::TextDelta(text) => {
                 tracing::trace!(%agent, text_len = text.len(), "agent text delta");
+                (AgentEventKind::TextDelta, String::new())
             }
             AgentEvent::ThinkingDelta(text) => {
                 tracing::trace!(%agent, text_len = text.len(), "agent thinking delta");
+                (AgentEventKind::ThinkingDelta, String::new())
             }
             AgentEvent::ToolCallsStart(calls) => {
                 tracing::debug!(%agent, count = calls.len(), "agent tool calls started");
+                let names: Vec<&str> = calls.iter().map(|c| c.function.name.as_str()).collect();
+                (AgentEventKind::ToolStart, names.join(", "))
             }
             AgentEvent::ToolResult { call_id, .. } => {
                 tracing::debug!(%agent, %call_id, "agent tool result");
+                (AgentEventKind::ToolResult, call_id.clone())
             }
             AgentEvent::ToolCallsComplete => {
                 tracing::debug!(%agent, "agent tool calls complete");
+                (AgentEventKind::ToolsComplete, String::new())
             }
             AgentEvent::Compact { summary } => {
                 tracing::info!(%agent, summary_len = summary.len(), "context compacted");
                 self.on_after_compact(agent, summary);
+                return;
             }
             AgentEvent::Done(response) => {
                 tracing::info!(
@@ -181,8 +200,15 @@ impl Hook for DaemonHook {
                     stop_reason = ?response.stop_reason,
                     "agent run complete"
                 );
+                (AgentEventKind::Done, String::new())
             }
-        }
+        };
+        let _ = self.events_tx.send(AgentEventMsg {
+            agent: agent.to_string(),
+            session: session_id,
+            kind: kind.into(),
+            content,
+        });
     }
 }
 
@@ -197,6 +223,7 @@ impl DaemonHook {
         memory: Option<Memory>,
         event_tx: DaemonEventSender,
     ) -> Self {
+        let (events_tx, _) = broadcast::channel(256);
         Self {
             skills,
             mcp,
@@ -206,7 +233,14 @@ impl DaemonHook {
             event_tx,
             scopes: BTreeMap::new(),
             agent_descriptions: BTreeMap::new(),
+            events_tx,
+            pending_asks: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Subscribe to agent events (for console event streaming).
+    pub fn subscribe_events(&self) -> broadcast::Receiver<AgentEventMsg> {
+        self.events_tx.subscribe()
     }
 
     /// Register an agent's scope for dispatch enforcement.
@@ -327,6 +361,7 @@ impl DaemonHook {
         args: &str,
         agent: &str,
         _sender: &str,
+        session_id: Option<u64>,
     ) -> String {
         // Dispatch enforcement: reject tools not in the agent's whitelist.
         if let Some(scope) = self.scopes.get(agent)
@@ -344,6 +379,7 @@ impl DaemonHook {
             "remember" => self.dispatch_remember(args).await,
             "memory" => self.dispatch_memory(args).await,
             "forget" => self.dispatch_forget(args).await,
+            "ask_user" => self.dispatch_ask_user(args, session_id).await,
             name => format!("tool not available: {name}"),
         }
     }

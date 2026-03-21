@@ -3,13 +3,14 @@
 use crate::repl::{
     command::{ReplHelper, SlashResult, handle_slash},
     render::{MarkdownRenderer, styled_prompt, welcome_banner},
-    runner::{OutputChunk, Runner},
+    runner::{ConnectionInfo, OutputChunk, Runner, send_reply},
 };
 use anyhow::Result;
 use futures_core::Stream;
 use futures_util::StreamExt;
 use rustyline::{Editor, config::CompletionType, error::ReadlineError, history::DefaultHistory};
-use std::{path::PathBuf, pin::pin};
+use std::{collections::HashMap, path::PathBuf, pin::pin};
+use wcore::protocol::message::AskQuestion;
 
 pub mod command;
 pub mod render;
@@ -73,8 +74,9 @@ impl ChatRepl {
                 }
             };
             println!();
+            let conn_info = self.runner.conn_info().clone();
             let stream = self.runner.stream(&self.agent, &content);
-            stream_to_terminal(stream).await?;
+            stream_to_terminal(stream, &conn_info).await?;
             println!();
         }
 
@@ -134,7 +136,10 @@ fn history_file_path() -> Option<PathBuf> {
 }
 
 /// Consume a stream of output chunks and render them via `MarkdownRenderer`.
-async fn stream_to_terminal(stream: impl Stream<Item = Result<OutputChunk>>) -> Result<()> {
+async fn stream_to_terminal(
+    stream: impl Stream<Item = Result<OutputChunk>>,
+    conn_info: &ConnectionInfo,
+) -> Result<()> {
     let mut stream = pin!(stream);
     let mut renderer = MarkdownRenderer::new();
 
@@ -157,6 +162,14 @@ async fn stream_to_terminal(stream: impl Stream<Item = Result<OutputChunk>>) -> 
                     Some(Ok(OutputChunk::ToolDone(success))) => {
                         renderer.push_tool_done(success);
                     }
+                    Some(Ok(OutputChunk::AskUser { questions, session })) => {
+                        renderer.finish();
+                        println!();
+                        let reply = ask_user_interactive(&questions).await?;
+                        if let Err(e) = send_reply(conn_info, session, reply).await {
+                            eprintln!("failed to send reply: {e}");
+                        }
+                    }
                     Some(Err(e)) => {
                         renderer.finish();
                         eprintln!("\nError: {e}");
@@ -175,4 +188,72 @@ async fn stream_to_terminal(stream: impl Stream<Item = Result<OutputChunk>>) -> 
 
     renderer.finish();
     Ok(())
+}
+
+/// Present structured questions interactively using dialoguer.
+///
+/// Returns a JSON string mapping question text to selected label(s).
+async fn ask_user_interactive(questions: &[AskQuestion]) -> Result<String> {
+    let questions = questions.to_vec();
+    tokio::task::spawn_blocking(move || {
+        use dialoguer::{Input, MultiSelect, Select, theme::ColorfulTheme};
+
+        let theme = ColorfulTheme::default();
+        let mut answers: HashMap<String, String> = HashMap::new();
+
+        for q in &questions {
+            println!("{}", console::style(&q.header).bold().cyan());
+            println!("{}", console::style(&q.question).yellow());
+
+            // Build item labels: "label — description"
+            let mut items: Vec<String> = q
+                .options
+                .iter()
+                .map(|o| {
+                    if o.description.is_empty() {
+                        o.label.clone()
+                    } else {
+                        format!("{} — {}", o.label, o.description)
+                    }
+                })
+                .collect();
+            items.push("Other".to_string());
+
+            if q.multi_select {
+                let selections = MultiSelect::with_theme(&theme).items(&items).interact()?;
+
+                let other_idx = items.len() - 1;
+                if selections.contains(&other_idx) {
+                    let text: String = Input::with_theme(&theme)
+                        .with_prompt("Your answer")
+                        .interact_text()?;
+                    answers.insert(q.question.clone(), text);
+                } else {
+                    let labels: Vec<&str> = selections
+                        .iter()
+                        .map(|&i| q.options[i].label.as_str())
+                        .collect();
+                    answers.insert(q.question.clone(), labels.join(", "));
+                }
+            } else {
+                let selection = Select::with_theme(&theme)
+                    .items(&items)
+                    .default(0)
+                    .interact()?;
+
+                let other_idx = items.len() - 1;
+                if selection == other_idx {
+                    let text: String = Input::with_theme(&theme)
+                        .with_prompt("Your answer")
+                        .interact_text()?;
+                    answers.insert(q.question.clone(), text);
+                } else {
+                    answers.insert(q.question.clone(), q.options[selection].label.clone());
+                }
+            }
+        }
+
+        Ok(serde_json::to_string(&answers)?)
+    })
+    .await?
 }
