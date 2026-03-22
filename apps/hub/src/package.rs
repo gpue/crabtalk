@@ -1,254 +1,142 @@
 //! Crabtalk hub package install/uninstall operations.
+//!
+//! Install copies a manifest to `packages/scope/name.toml` and clones the
+//! source repo to `.cache/repos/{slug}`. Skills and agents are discovered
+//! from the cached repo by convention on daemon reload.
 
 use crate::manifest;
 use anyhow::{Context, Result};
-use std::collections::BTreeSet;
-use std::path::Path;
-use wcore::paths::CONFIG_DIR;
+use std::path::{Path, PathBuf};
+use wcore::{Setup, paths::CONFIG_DIR};
 
 /// Remote URL of the crabtalk hub repository.
 pub const CRABTALK_HUB: &str = "https://github.com/crabtalk/hub";
 
-/// Parsed filters for selective install/uninstall.
-///
-/// When all sets are empty, everything is included (no filtering).
-/// Filter format: `"kind:name"` — e.g. `"skill:playwright-cli"`.
-pub struct HubFilter {
-    pub mcps: BTreeSet<String>,
-    pub skills: BTreeSet<String>,
-    pub agents: BTreeSet<String>,
-    pub commands: BTreeSet<String>,
-}
-
-impl HubFilter {
-    pub fn parse(filters: &[String]) -> Self {
-        let mut f = Self {
-            mcps: BTreeSet::new(),
-            skills: BTreeSet::new(),
-            agents: BTreeSet::new(),
-            commands: BTreeSet::new(),
-        };
-        for raw in filters {
-            if let Some((kind, name)) = raw.split_once(':') {
-                let set = match kind {
-                    "mcp" => &mut f.mcps,
-                    "skill" => &mut f.skills,
-                    "agent" => &mut f.agents,
-                    "command" => &mut f.commands,
-                    _ => continue,
-                };
-                set.insert(name.to_string());
-            }
-        }
-        f
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.mcps.is_empty()
-            && self.skills.is_empty()
-            && self.agents.is_empty()
-            && self.commands.is_empty()
-    }
-
-    pub fn wants_mcp(&self, name: &str) -> bool {
-        self.is_empty() || self.mcps.contains(name)
-    }
-
-    pub fn wants_skill(&self, name: &str) -> bool {
-        self.is_empty() || self.skills.contains(name)
-    }
-
-    pub fn wants_agent(&self, name: &str) -> bool {
-        self.is_empty() || self.agents.contains(name)
-    }
-
-    pub fn wants_command(&self, name: &str) -> bool {
-        self.is_empty() || self.commands.contains(name)
-    }
+/// Result of a successful install, carrying info the CLI needs for prompt setup.
+pub struct InstallResult {
+    /// Setup configuration from the manifest, if any.
+    pub setup: Option<Setup>,
+    /// Path to the cached source repo, if cloned.
+    pub repo_dir: Option<PathBuf>,
 }
 
 /// Install a hub package.
 ///
-/// Syncs the hub repo, reads the manifest, merges MCP servers
-/// into `crab.toml`, copies skill directories into `~/.crabtalk/skills/`,
-/// and installs agents (prompt files + their declared skills).
-///
-/// When `filters` is non-empty, only matching components are installed.
-/// Progress messages are reported via `on_step`.
-pub async fn install(package: &str, filters: &[String], on_step: impl Fn(&str)) -> Result<()> {
-    let filter = HubFilter::parse(filters);
+/// Syncs the hub repo, copies the manifest to `packages/scope/name.toml`,
+/// and clones the source repo to `.cache/repos/{slug}/`. Runs command-type
+/// setup if configured. Returns [`InstallResult`] so the CLI can handle
+/// prompt-type setup after daemon reload.
+pub async fn install(
+    package: &str,
+    branch: Option<&str>,
+    on_step: impl Fn(&str),
+) -> Result<InstallResult> {
+    let (scope, name) = parse_package(package)?;
 
     // Sync hub repo (clone or update).
+    on_step("syncing hub…");
     let hub_dir = CONFIG_DIR.join("hub");
-    git_sync(CRABTALK_HUB, &hub_dir)
+    git_sync(CRABTALK_HUB, &hub_dir, None)
         .await
         .context("failed to sync hub repo")?;
 
-    let (scope, name) = parse_package(package)?;
+    // Read the manifest from the hub repo.
     let manifest = read_manifest(scope, name)?;
 
-    // Merge MCP servers (convert McpResource → McpServerConfig for crab.toml).
-    let wanted_mcps: Vec<_> = manifest
-        .mcps
-        .iter()
-        .filter(|(k, _)| filter.wants_mcp(k.as_str()))
-        .map(|(k, v)| (k, v.to_server_config()))
-        .collect();
-    if !wanted_mcps.is_empty() {
-        on_step("adding MCP servers…");
-        let refs: Vec<_> = wanted_mcps.iter().map(|(k, v)| (*k, v)).collect();
-        merge_section_filtered("mcps", &refs)?;
-    }
+    // Copy manifest to packages/scope/name.toml.
+    on_step("installing manifest…");
+    let packages_dir = CONFIG_DIR.join(wcore::paths::PACKAGES_DIR);
+    let scope_dir = packages_dir.join(scope);
+    std::fs::create_dir_all(&scope_dir)
+        .with_context(|| format!("failed to create {}", scope_dir.display()))?;
+    let manifest_dst = scope_dir.join(format!("{name}.toml"));
+    let manifest_src = hub_dir.join(scope).join(format!("{name}.toml"));
+    std::fs::copy(&manifest_src, &manifest_dst).with_context(|| {
+        format!(
+            "failed to copy manifest {} → {}",
+            manifest_src.display(),
+            manifest_dst.display()
+        )
+    })?;
 
-    // Collect skill keys from wanted agents.
-    let wanted_agents: Vec<_> = manifest
-        .agents
-        .iter()
-        .filter(|(k, _)| filter.wants_agent(k.as_str()))
-        .collect();
-    let mut agent_skill_keys: BTreeSet<&String> = BTreeSet::new();
-    for (_, agent) in &wanted_agents {
-        for sk in &agent.skills {
-            agent_skill_keys.insert(sk);
-        }
-    }
-
-    // Install skills (top-level wanted + agent-referenced).
-    let all_skill_keys: BTreeSet<&String> = manifest
-        .skills
-        .keys()
-        .filter(|k| filter.wants_skill(k.as_str()))
-        .chain(agent_skill_keys.iter().copied())
-        .collect();
-
-    if !all_skill_keys.is_empty() {
-        on_step("installing skills…");
-
-        // Clone the source repo once, then copy per-skill subdirectories.
-        let slug = repo_slug(&manifest.package.repository);
-        if slug.is_empty() {
-            anyhow::bail!("manifest has no repository URL for skill install");
-        }
-        let repo_dir = CONFIG_DIR.join(".cache").join("repos").join(&slug);
-        std::fs::create_dir_all(repo_dir.parent().context("repo cache path has no parent")?)
+    // Clone the source repo to .cache/repos/{slug}/ if it has a repository URL.
+    let repo_dir = if !manifest.package.repository.is_empty() {
+        on_step("cloning source repo…");
+        let slug = wcore::repo_slug(&manifest.package.repository);
+        let dir = CONFIG_DIR.join(".cache").join("repos").join(&slug);
+        std::fs::create_dir_all(dir.parent().context("repo cache path has no parent")?)
             .context("failed to create repo cache dir")?;
-        git_sync(&manifest.package.repository, &repo_dir)
+        // CLI --branch overrides manifest branch.
+        let effective_branch = branch.or(manifest.package.branch.as_deref());
+        git_sync(&manifest.package.repository, &dir, effective_branch)
             .await
             .with_context(|| format!("failed to sync repo {}", &manifest.package.repository))?;
+        Some(dir)
+    } else {
+        None
+    };
 
-        let skills_dir = CONFIG_DIR.join("skills");
-        std::fs::create_dir_all(&skills_dir).context("failed to create skills dir")?;
-
-        for key in &all_skill_keys {
-            let skill = manifest.skills.get(*key).ok_or_else(|| {
-                anyhow::anyhow!("agent references skill '{key}' not found in [skills]")
-            })?;
-            on_step(&format!("installing skill {key}…"));
-
-            let src = repo_dir.join(skill.path.as_str());
-            let dst = skills_dir.join(key.as_str());
-            if dst.exists() {
-                std::fs::remove_dir_all(&dst)
-                    .with_context(|| format!("failed to remove old skill {key}"))?;
-            }
-            copy_dir_all(&src, &dst).with_context(|| format!("failed to copy skill {key}"))?;
-        }
+    // Run command-type setup from the cached repo.
+    if let Some(Setup::Command { ref command }) = manifest.package.setup
+        && let Some(ref dir) = repo_dir
+    {
+        on_step("running setup command…");
+        let status = tokio::process::Command::new("sh")
+            .args(["-c", command])
+            .current_dir(dir)
+            .status()
+            .await
+            .with_context(|| format!("failed to run setup command: {command}"))?;
+        anyhow::ensure!(status.success(), "setup command exited with {status}");
     }
 
-    // Install agents (copy prompt .md files).
-    if !wanted_agents.is_empty() {
-        on_step("installing agents…");
-        install_agents_filtered(scope, &wanted_agents)?;
-    }
-
-    // Register commands (merge metadata into crab.toml).
-    let wanted_cmds: Vec<_> = manifest
-        .commands
-        .iter()
-        .filter(|(k, _)| filter.wants_command(k.as_str()))
-        .collect();
-    if !wanted_cmds.is_empty() {
-        on_step("registering commands…");
-        merge_section_filtered("commands", &wanted_cmds)?;
-    }
-
-    Ok(())
+    Ok(InstallResult {
+        setup: manifest.package.setup,
+        repo_dir,
+    })
 }
 
 /// Uninstall a hub package.
 ///
-/// Reads the manifest from the local hub repo (no network sync), removes MCP
-/// servers from `crab.toml`, deletes skill directories and agent prompt files.
-///
-/// When `filters` is non-empty, only matching components are removed.
-/// Progress messages are reported via `on_step`.
-pub async fn uninstall(package: &str, filters: &[String], on_step: impl Fn(&str)) -> Result<()> {
-    let filter = HubFilter::parse(filters);
-
+/// Deletes the manifest from `packages/scope/name.toml` and optionally
+/// prunes the cached source repo.
+pub async fn uninstall(package: &str, on_step: impl Fn(&str)) -> Result<()> {
     let (scope, name) = parse_package(package)?;
-    let manifest = read_manifest(scope, name)?;
 
-    let mcp_keys: Vec<_> = manifest
-        .mcps
-        .keys()
-        .filter(|k| filter.wants_mcp(k.as_str()))
-        .collect();
-    if !mcp_keys.is_empty() {
-        on_step("removing MCP servers…");
-        remove_keys_from_section("mcps", &mcp_keys)?;
+    // Read manifest before deleting (need repository URL for cache cleanup).
+    let manifest = read_manifest(scope, name).ok();
+
+    // Delete manifest from packages/.
+    on_step("removing manifest…");
+    let manifest_path = CONFIG_DIR
+        .join(wcore::paths::PACKAGES_DIR)
+        .join(scope)
+        .join(format!("{name}.toml"));
+    if manifest_path.exists() {
+        std::fs::remove_file(&manifest_path)
+            .with_context(|| format!("failed to remove {}", manifest_path.display()))?;
     }
 
-    // Collect agent-declared skill keys (mirrors install logic).
-    let wanted_agents: Vec<_> = manifest
-        .agents
-        .iter()
-        .filter(|(k, _)| filter.wants_agent(k.as_str()))
-        .collect();
-    let mut agent_skill_keys: BTreeSet<&String> = BTreeSet::new();
-    for (_, agent) in &wanted_agents {
-        for sk in &agent.skills {
-            agent_skill_keys.insert(sk);
+    // Clean up empty scope directory.
+    let scope_dir = CONFIG_DIR.join(wcore::paths::PACKAGES_DIR).join(scope);
+    if scope_dir.exists()
+        && std::fs::read_dir(&scope_dir)
+            .map(|mut d| d.next().is_none())
+            .unwrap_or(false)
+    {
+        let _ = std::fs::remove_dir(&scope_dir);
+    }
+
+    // Prune cached repo if no other package references it.
+    if let Some(manifest) = manifest
+        && !manifest.package.repository.is_empty()
+    {
+        let slug = wcore::repo_slug(&manifest.package.repository);
+        let repo_dir = CONFIG_DIR.join(".cache").join("repos").join(&slug);
+        if repo_dir.exists() {
+            on_step("pruning cached repo…");
+            let _ = std::fs::remove_dir_all(&repo_dir);
         }
-    }
-
-    let skill_keys: BTreeSet<&String> = manifest
-        .skills
-        .keys()
-        .filter(|k| filter.wants_skill(k.as_str()))
-        .chain(agent_skill_keys.iter().copied())
-        .collect();
-    if !skill_keys.is_empty() {
-        on_step("removing skills…");
-        let skills_dir = CONFIG_DIR.join("skills");
-        for key in &skill_keys {
-            let dst = skills_dir.join(key.as_str());
-            if dst.exists() {
-                std::fs::remove_dir_all(&dst)
-                    .with_context(|| format!("failed to remove skill {key}"))?;
-            }
-        }
-    }
-
-    if !wanted_agents.is_empty() {
-        on_step("removing agents…");
-        let agents_dir = CONFIG_DIR.join(wcore::paths::AGENTS_DIR);
-        for (name, _) in &wanted_agents {
-            let dst = agents_dir.join(format!("{name}.md"));
-            if dst.exists() {
-                std::fs::remove_file(&dst)
-                    .with_context(|| format!("failed to remove agent prompt {}", dst.display()))?;
-            }
-        }
-    }
-
-    let cmd_keys: Vec<_> = manifest
-        .commands
-        .keys()
-        .filter(|k| filter.wants_command(k.as_str()))
-        .collect();
-    if !cmd_keys.is_empty() {
-        on_step("removing commands…");
-        remove_keys_from_section("commands", &cmd_keys)?;
     }
 
     Ok(())
@@ -257,38 +145,41 @@ pub async fn uninstall(package: &str, filters: &[String], on_step: impl Fn(&str)
 // ── Helpers ───────────────────────────────────────────────────────
 
 /// Ensure `dest` is a shallow clone of `url`, creating or updating as needed.
-pub async fn git_sync(url: &str, dest: &Path) -> Result<()> {
+/// If `branch` is provided, clone/fetch that specific branch.
+pub async fn git_sync(url: &str, dest: &Path, branch: Option<&str>) -> Result<()> {
     use tokio::process::Command;
 
+    let dest_str = dest.to_string_lossy();
+    let ref_name = branch
+        .map(|b| format!("origin/{b}"))
+        .unwrap_or_else(|| "origin/HEAD".to_string());
+
     if dest.exists() {
+        let mut args = vec!["-C", &*dest_str, "fetch", "--depth=1", "origin"];
+        if let Some(b) = branch {
+            args.push(b);
+        }
         let status = Command::new("git")
-            .args([
-                "-C",
-                &dest.to_string_lossy(),
-                "fetch",
-                "--depth=1",
-                "origin",
-            ])
+            .args(&args)
             .status()
             .await
             .context("git fetch failed")?;
         anyhow::ensure!(status.success(), "git fetch exited with {status}");
 
         let status = Command::new("git")
-            .args([
-                "-C",
-                &dest.to_string_lossy(),
-                "reset",
-                "--hard",
-                "origin/HEAD",
-            ])
+            .args(["-C", &*dest_str, "reset", "--hard", &ref_name])
             .status()
             .await
             .context("git reset failed")?;
         anyhow::ensure!(status.success(), "git reset exited with {status}");
     } else {
+        let mut args = vec!["clone", "--depth=1"];
+        if let Some(b) = branch {
+            args.extend(["-b", b]);
+        }
+        args.extend([url, &*dest_str]);
         let status = Command::new("git")
-            .args(["clone", "--depth=1", url, &dest.to_string_lossy()])
+            .args(&args)
             .status()
             .await
             .context("git clone failed")?;
@@ -315,117 +206,4 @@ pub fn read_manifest(scope: &str, name: &str) -> Result<manifest::Manifest> {
     let content = std::fs::read_to_string(&path)
         .with_context(|| format!("cannot read manifest at {}", path.display()))?;
     toml::from_str(&content).with_context(|| format!("invalid manifest at {}", path.display()))
-}
-
-/// Merge serializable entries into a named section of `crab.toml`.
-fn merge_section_filtered<T: serde::Serialize>(
-    section: &str,
-    entries: &[(&String, &T)],
-) -> Result<()> {
-    use toml_edit::DocumentMut;
-
-    let config_path = CONFIG_DIR.join("crab.toml");
-    let content = std::fs::read_to_string(&config_path)
-        .with_context(|| format!("cannot read {}", config_path.display()))?;
-    let mut doc: DocumentMut = content
-        .parse()
-        .with_context(|| format!("invalid TOML in {}", config_path.display()))?;
-
-    let table = doc
-        .entry(section)
-        .or_insert(toml_edit::Item::Table(toml_edit::Table::new()))
-        .as_table_mut()
-        .with_context(|| format!("{section} is not a table"))?;
-
-    for (key, cfg) in entries {
-        let doc = toml_edit::ser::to_document(cfg)
-            .with_context(|| format!("failed to serialize entry for {key}"))?;
-        let item = toml_edit::Item::Table(doc.as_table().clone());
-        table.insert(key.as_str(), item);
-    }
-
-    std::fs::write(&config_path, doc.to_string())
-        .with_context(|| format!("failed to write {}", config_path.display()))?;
-    Ok(())
-}
-
-/// Remove keys from a TOML section in `crab.toml`.
-fn remove_keys_from_section(section: &str, keys: &[&String]) -> Result<()> {
-    use toml_edit::DocumentMut;
-
-    let config_path = CONFIG_DIR.join("crab.toml");
-    let content = std::fs::read_to_string(&config_path)
-        .with_context(|| format!("cannot read {}", config_path.display()))?;
-    let mut doc: DocumentMut = content
-        .parse()
-        .with_context(|| format!("invalid TOML in {}", config_path.display()))?;
-
-    if let Some(table) = doc.get_mut(section).and_then(|v| v.as_table_mut()) {
-        for key in keys {
-            table.remove(key.as_str());
-        }
-    }
-
-    std::fs::write(&config_path, doc.to_string())
-        .with_context(|| format!("failed to write {}", config_path.display()))?;
-    Ok(())
-}
-
-/// Install selected agent prompt files from the hub repo.
-fn install_agents_filtered(
-    scope: &str,
-    agents: &[(&String, &manifest::AgentResource)],
-) -> Result<()> {
-    let agents_dir = CONFIG_DIR.join(wcore::paths::AGENTS_DIR);
-    std::fs::create_dir_all(&agents_dir).context("failed to create agents directory")?;
-
-    let hub_dir = CONFIG_DIR.join("hub");
-    for (name, agent) in agents {
-        let src = hub_dir.join(scope).join(agent.prompt.as_str());
-        let dst = agents_dir.join(format!("{name}.md"));
-        std::fs::copy(&src, &dst).with_context(|| {
-            format!(
-                "failed to copy agent prompt {} -> {}",
-                src.display(),
-                dst.display()
-            )
-        })?;
-    }
-    Ok(())
-}
-
-/// Convert a repo URL to a filesystem-safe slug.
-///
-/// e.g. `https://github.com/microsoft/playwright-cli` → `github-com-microsoft-playwright-cli`
-fn repo_slug(url: &str) -> String {
-    url.chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '-' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>()
-        .trim_matches('-')
-        .to_string()
-}
-
-/// Recursively copy `src` directory into `dst`.
-fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
-    std::fs::create_dir_all(dst)?;
-    for entry in
-        std::fs::read_dir(src).with_context(|| format!("cannot read dir {}", src.display()))?
-    {
-        let entry = entry?;
-        let ty = entry.file_type()?;
-        let to = dst.join(entry.file_name());
-        if ty.is_dir() {
-            copy_dir_all(&entry.path(), &to)?;
-        } else {
-            std::fs::copy(entry.path(), &to)
-                .with_context(|| format!("failed to copy {}", entry.path().display()))?;
-        }
-    }
-    Ok(())
 }

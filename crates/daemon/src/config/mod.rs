@@ -3,31 +3,42 @@
 pub use crate::hook::{mcp::McpServerConfig, system::SystemConfig};
 pub use ::model::{ProviderDef, ProviderRegistry, validate_providers};
 use anyhow::Result;
-pub use loader::{DEFAULT_CONFIG, load_agents_dir, scaffold_config_dir};
+pub use loader::{DEFAULT_CONFIG, scaffold_config_dir};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 pub use wcore::{
-    AgentConfig, HeartbeatConfig,
-    paths::{AGENTS_DIR, CONFIG_DIR, SKILLS_DIR, SOCKET_PATH},
+    AgentConfig, HeartbeatConfig, ManifestConfig, ResolvedManifest, load_agents_dir,
+    load_agents_dirs,
+    paths::{AGENTS_DIR, CONFIG_DIR, CONFIG_FILE, SKILLS_DIR, SOCKET_PATH},
+    resolve_manifests,
 };
 
 mod loader;
 
-/// Top-level daemon configuration.
+/// Top-level daemon configuration (`config.toml`).
+///
+/// System-only: providers, system settings, and env vars for MCP processes.
+/// MCPs and agent configs live in manifests (`local/CrabTalk.toml` and
+/// `packages/*/*.toml`), loaded via [`resolve_manifests`].
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DaemonConfig {
     /// Provider definitions (`[provider.<name>]`).
     #[serde(default)]
     pub provider: BTreeMap<String, ProviderDef>,
-    /// MCP server configurations.
+    /// **Deprecated**: MCP configs migrated to `local/CrabTalk.toml`.
+    /// Kept for backwards compatibility during migration.
     #[serde(default)]
     pub mcps: BTreeMap<String, McpServerConfig>,
     /// System configuration (tasks + memory).
     #[serde(default)]
     pub system: SystemConfig,
-    /// Per-agent configurations (name → config).
+    /// **Deprecated**: Agent configs migrated to `local/CrabTalk.toml`.
+    /// Kept for backwards compatibility during migration.
     #[serde(default)]
     pub agents: BTreeMap<String, AgentConfig>,
+    /// Environment variables passed to all MCP server processes at spawn time.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
 }
 
 impl DaemonConfig {
@@ -39,6 +50,12 @@ impl DaemonConfig {
                 server.name = name.clone();
             }
         });
+        if !config.mcps.is_empty() {
+            tracing::warn!("[mcps] in config.toml is deprecated — move to local/CrabTalk.toml");
+        }
+        if !config.agents.is_empty() {
+            tracing::warn!("[agents] in config.toml is deprecated — move to local/CrabTalk.toml");
+        }
         validate_providers(&config.provider)?;
         Ok(config)
     }

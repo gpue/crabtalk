@@ -1,13 +1,11 @@
 //! Hub package management command.
 
-use crate::repl::runner::Runner;
+use crate::repl::{self, runner::Runner};
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
-use crabhub::manifest::{Manifest, SetupConfig};
-use dialoguer::{Input, MultiSelect, theme::ColorfulTheme};
+use crabhub::manifest::Manifest;
 use std::path::{Path, PathBuf};
-use toml_edit::{DocumentMut, value};
-use wcore::paths::CONFIG_DIR;
+use wcore::Setup;
 
 /// Manage hub packages.
 #[derive(Args, Debug)]
@@ -21,7 +19,7 @@ pub struct Hub {
 #[derive(Subcommand, Debug)]
 pub enum HubCommand {
     /// Install a hub package.
-    Install(HubPackage),
+    Install(HubInstall),
     /// Uninstall a hub package.
     Uninstall(HubPackage),
     /// Test manifest parsing for all .toml files in a hub directory.
@@ -35,54 +33,21 @@ pub struct HubTest {
     pub path: PathBuf,
 }
 
-/// Package argument shared by install and uninstall.
+/// Install arguments.
+#[derive(Args, Debug)]
+pub struct HubInstall {
+    /// Package identifier in `scope/name` format.
+    pub package: String,
+    /// Branch to clone (overrides manifest default).
+    #[arg(long)]
+    pub branch: Option<String>,
+}
+
+/// Package argument shared by uninstall.
 #[derive(Args, Debug)]
 pub struct HubPackage {
     /// Package identifier in `scope/name` format.
     pub package: String,
-
-    /// Install only specific skills by name.
-    #[arg(long)]
-    pub skill: Vec<String>,
-
-    /// Install only specific MCP servers by name.
-    #[arg(long)]
-    pub mcp: Vec<String>,
-
-    /// Install only specific agents by name.
-    #[arg(long)]
-    pub agent: Vec<String>,
-
-    /// Install only specific commands by name.
-    #[arg(long)]
-    pub command: Vec<String>,
-}
-
-impl HubPackage {
-    /// Build filter strings from the CLI flags.
-    fn filters(&self) -> Vec<String> {
-        let mut out = Vec::new();
-        for s in &self.skill {
-            out.push(format!("skill:{s}"));
-        }
-        for s in &self.mcp {
-            out.push(format!("mcp:{s}"));
-        }
-        for s in &self.agent {
-            out.push(format!("agent:{s}"));
-        }
-        for s in &self.command {
-            out.push(format!("command:{s}"));
-        }
-        out
-    }
-
-    fn has_filters(&self) -> bool {
-        !self.skill.is_empty()
-            || !self.mcp.is_empty()
-            || !self.agent.is_empty()
-            || !self.command.is_empty()
-    }
 }
 
 impl Hub {
@@ -92,145 +57,53 @@ impl Hub {
             return test_manifest(&t.path);
         }
 
-        let (pkg, is_install, has_flags, explicit_filters) = match self.command {
-            HubCommand::Install(p) => {
-                let has = p.has_filters();
-                let filters = p.filters();
-                (p.package, true, has, filters)
-            }
-            HubCommand::Uninstall(p) => {
-                let has = p.has_filters();
-                let filters = p.filters();
-                (p.package, false, has, filters)
-            }
+        let (pkg, branch, is_install) = match self.command {
+            HubCommand::Install(p) => (p.package, p.branch, true),
+            HubCommand::Uninstall(p) => (p.package, None, false),
             HubCommand::Test(_) => unreachable!(),
         };
 
         let on_step = |msg: &str| println!("  {msg}");
 
         if is_install {
-            // Sync hub repo and read manifest for picker + setup.
-            let (scope, name) = crabhub::package::parse_package(&pkg)?;
-            let hub_dir = CONFIG_DIR.join("hub");
-            let hub_url = "https://github.com/aspect-build/crabtalk-hub";
-            crabhub::package::git_sync(hub_url, &hub_dir).await?;
-            let manifest = crabhub::package::read_manifest(scope, name)?;
-
-            // Determine filters: explicit flags bypass picker.
-            let filters = if has_flags {
-                explicit_filters
-            } else {
-                pick_components(&manifest)?
-            };
-
-            // Collect setup configs for selected components before install.
-            let setups = collect_setups(&manifest, &filters);
-
-            crabhub::package::install(&pkg, &filters, on_step).await?;
+            let result = crabhub::package::install(&pkg, branch.as_deref(), on_step).await?;
             println!("Done: {pkg}");
 
-            // Run setup commands.
-            run_setups(&setups);
+            // Reload daemon to pick up new components.
+            let _ = runner.reload().await;
+            println!("Daemon reloaded.");
 
-            // Env var prompting + daemon reload.
-            let config_path = CONFIG_DIR.join("crab.toml");
-            if config_path.exists() {
-                let changed = prompt_empty_env_vars(&config_path)?;
-                if changed {
-                    let _ = runner.reload().await;
-                    println!("Daemon reloaded.");
-                }
-                println!("\nRun `crabtalk auth` to reconfigure these values later.");
+            // Run prompt-type setup via inference.
+            if let Some(Setup::Prompt { ref prompt }) = result.setup {
+                let prompt_text = if prompt.ends_with(".md") {
+                    let repo_dir = result
+                        .repo_dir
+                        .as_ref()
+                        .context("prompt setup requires a repository but none was cloned")?;
+                    std::fs::read_to_string(repo_dir.join(prompt))
+                        .with_context(|| format!("failed to read setup prompt: {}", prompt))?
+                } else {
+                    prompt.clone()
+                };
+
+                println!("Running setup…");
+                let conn_info = runner.conn_info().clone();
+                let stream = runner.stream(wcore::paths::DEFAULT_AGENT, &prompt_text);
+                repl::stream_to_terminal(stream, &conn_info).await?;
+                println!();
             }
+
+            println!("Configure env vars in config.toml [env] section if needed.");
         } else {
-            crabhub::package::uninstall(&pkg, &explicit_filters, on_step).await?;
+            crabhub::package::uninstall(&pkg, on_step).await?;
             println!("Done: {pkg}");
+
+            // Reload daemon to drop removed components.
+            let _ = runner.reload().await;
+            println!("Daemon reloaded.");
         }
 
         Ok(())
-    }
-}
-
-/// Show an interactive component picker. Returns filter strings.
-/// If only one component exists, skips the picker and returns empty (install all).
-fn pick_components(manifest: &Manifest) -> Result<Vec<String>> {
-    let mut items: Vec<String> = Vec::new();
-    for key in manifest.skills.keys() {
-        items.push(format!("skill:{key}"));
-    }
-    for key in manifest.mcps.keys() {
-        items.push(format!("mcp:{key}"));
-    }
-    for key in manifest.agents.keys() {
-        items.push(format!("agent:{key}"));
-    }
-    for key in manifest.commands.keys() {
-        items.push(format!("command:{key}"));
-    }
-
-    // Single component or empty — install everything, no picker needed.
-    if items.len() <= 1 {
-        return Ok(vec![]);
-    }
-
-    let defaults: Vec<bool> = vec![true; items.len()];
-    let theme = ColorfulTheme::default();
-    let selections = MultiSelect::with_theme(&theme)
-        .with_prompt("Select components to install")
-        .items(&items)
-        .defaults(&defaults)
-        .interact()?;
-
-    // All selected — no filter needed.
-    if selections.len() == items.len() {
-        return Ok(vec![]);
-    }
-
-    Ok(selections.into_iter().map(|i| items[i].clone()).collect())
-}
-
-/// Collect setup configs for the selected components.
-fn collect_setups<'a>(
-    manifest: &'a Manifest,
-    filters: &[String],
-) -> Vec<(&'a str, &'a SetupConfig)> {
-    let mut setups: Vec<(&str, &SetupConfig)> = Vec::new();
-    let no_filter = filters.is_empty();
-
-    for (key, res) in &manifest.skills {
-        if let Some(ref setup) = res.setup
-            && (no_filter || filters.iter().any(|f| f == &format!("skill:{key}")))
-        {
-            setups.push((key, setup));
-        }
-    }
-    for (key, res) in &manifest.mcps {
-        if let Some(ref setup) = res.setup
-            && (no_filter || filters.iter().any(|f| f == &format!("mcp:{key}")))
-        {
-            setups.push((key, setup));
-        }
-    }
-
-    setups
-}
-
-/// Run setup commands, printing messages. Failures are non-fatal.
-fn run_setups(setups: &[(&str, &SetupConfig)]) {
-    for (name, setup) in setups {
-        println!("\nRunning setup for {name}: {}", setup.message);
-        let status = std::process::Command::new("sh")
-            .args(["-c", &setup.run])
-            .status();
-        match status {
-            Ok(s) if s.success() => {}
-            Ok(s) => {
-                eprintln!("  Setup for {name} exited with {s}");
-            }
-            Err(e) => {
-                eprintln!("  Setup for {name} failed: {e}");
-            }
-        }
     }
 }
 
@@ -242,58 +115,4 @@ fn test_manifest(path: &Path) -> Result<()> {
         toml::from_str(&content).with_context(|| format!("failed to parse {}", path.display()))?;
     println!("ok  {}", manifest.package.name);
     Ok(())
-}
-
-/// Scan `[mcps.*]` in crab.toml for empty env values,
-/// prompt the user for each one, and write non-empty responses back.
-/// Returns `true` if any values were filled.
-fn prompt_empty_env_vars(config_path: &Path) -> Result<bool> {
-    let content = std::fs::read_to_string(config_path)?;
-    let mut doc: DocumentMut = content.parse()?;
-    let theme = ColorfulTheme::default();
-    let mut changed = false;
-
-    for (section, label) in [("mcps", "MCP")] {
-        let Some(table) = doc.get_mut(section).and_then(|v| v.as_table_mut()) else {
-            continue;
-        };
-
-        let names: Vec<String> = table.iter().map(|(k, _)| k.to_string()).collect();
-        for name in &names {
-            let Some(entry) = table.get_mut(name).and_then(|v| v.as_table_mut()) else {
-                continue;
-            };
-            let Some(env) = entry.get_mut("env").and_then(|v| v.as_table_mut()) else {
-                continue;
-            };
-
-            let empty_keys: Vec<String> = env
-                .iter()
-                .filter(|(_, v)| v.as_str().is_some_and(|s| s.is_empty()))
-                .map(|(k, _)| k.to_string())
-                .collect();
-
-            if empty_keys.is_empty() {
-                continue;
-            }
-
-            println!("\nConfigure {label} \"{name}\":");
-            for key in &empty_keys {
-                let val: String = Input::with_theme(&theme)
-                    .with_prompt(format!("  {key}"))
-                    .allow_empty(true)
-                    .interact_text()?;
-                if !val.is_empty() {
-                    env.insert(key, value(&val));
-                    changed = true;
-                }
-            }
-        }
-    }
-
-    if changed {
-        std::fs::write(config_path, doc.to_string())?;
-    }
-
-    Ok(changed)
 }

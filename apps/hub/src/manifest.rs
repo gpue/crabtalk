@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use wcore::Setup;
 
 /// Crabtalk resource manifest.
 #[derive(Serialize, Deserialize)]
@@ -12,10 +13,6 @@ pub struct Manifest {
     /// MCP server configs
     #[serde(default)]
     pub mcps: BTreeMap<String, McpResource>,
-
-    /// Skill resources
-    #[serde(default)]
-    pub skills: BTreeMap<String, SkillResource>,
 
     /// Agent resources
     #[serde(default)]
@@ -40,9 +37,15 @@ pub struct Package {
     /// Source repository URL.
     #[serde(default)]
     pub repository: String,
+    /// Branch to clone (defaults to the repo's default branch).
+    #[serde(default)]
+    pub branch: Option<String>,
     /// Searchable keywords (for hub discovery).
     #[serde(default)]
     pub keywords: Vec<String>,
+    /// Setup configuration (run after install).
+    #[serde(default)]
+    pub setup: Option<Setup>,
 }
 
 /// An MCP server resource in a hub manifest.
@@ -61,8 +64,6 @@ pub struct McpResource {
     pub auto_restart: bool,
     /// HTTP URL for streamable HTTP transport.
     pub url: Option<String>,
-    /// Optional setup command to run after install.
-    pub setup: Option<SetupConfig>,
 }
 
 impl Default for McpResource {
@@ -74,13 +75,12 @@ impl Default for McpResource {
             env: BTreeMap::new(),
             auto_restart: true,
             url: None,
-            setup: None,
         }
     }
 }
 
 impl McpResource {
-    /// Convert to the runtime MCP config (without setup).
+    /// Convert to the runtime MCP config.
     pub fn to_server_config(&self) -> wcore::McpServerConfig {
         wcore::McpServerConfig {
             name: self.name.clone(),
@@ -93,40 +93,27 @@ impl McpResource {
     }
 }
 
-/// A setup command to run after install.
-#[derive(Serialize, Deserialize)]
-pub struct SetupConfig {
-    /// Shell command to execute.
-    pub run: String,
-    /// Human-readable message shown before running.
-    pub message: String,
-}
-
-/// A skill resource.
-#[derive(Serialize, Deserialize)]
-pub struct SkillResource {
-    /// Skill name (defaults to map key if empty)
-    #[serde(default)]
-    pub name: String,
-    /// Skill description
-    pub description: String,
-    /// Path within the repo to the skill directory
-    pub path: String,
-    /// Optional setup command to run after install.
-    #[serde(default)]
-    pub setup: Option<SetupConfig>,
-}
-
-/// An agent resource — system prompt + skill bundle.
+/// An agent resource — discovered by convention from `agents/*.md`.
 #[derive(Serialize, Deserialize)]
 pub struct AgentResource {
     /// Agent description
+    #[serde(default)]
     pub description: String,
-    /// Path to the prompt `.md` file in the hub repo (relative to scope dir)
+    /// Path to the prompt `.md` file (legacy, optional)
+    #[serde(default)]
     pub prompt: String,
-    /// Skill keys from `[skills.*]` in the same manifest to auto-install
+    /// Skill keys from `[skills.*]` in the same manifest
     #[serde(default)]
     pub skills: Vec<String>,
+    /// Model override for this agent
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Whether to enable thinking/reasoning mode
+    #[serde(default)]
+    pub thinking: bool,
+    /// MCP server names this agent can access
+    #[serde(default)]
+    pub mcps: Vec<String>,
 }
 
 /// Command service metadata for hub registration.

@@ -150,7 +150,7 @@ pub(crate) struct AuthState {
 
 impl AuthState {
     fn load() -> Result<Self> {
-        let config_path = wcore::paths::CONFIG_DIR.join("crab.toml");
+        let config_path = wcore::paths::CONFIG_DIR.join(wcore::paths::CONFIG_FILE);
         let mut providers = Vec::new();
         let mut active_model = String::new();
         let mut gateways = Vec::new();
@@ -222,8 +222,20 @@ impl AuthState {
                     });
                 }
             }
+        }
 
-            if let Some(mcps_table) = doc.get("mcps").and_then(|m| m.as_table()) {
+        // Load MCPs from local/CrabTalk.toml.
+        let manifest_path = wcore::paths::CONFIG_DIR
+            .join(wcore::paths::LOCAL_DIR)
+            .join("CrabTalk.toml");
+        if manifest_path.exists() {
+            let manifest_content = std::fs::read_to_string(&manifest_path)
+                .with_context(|| format!("cannot read {}", manifest_path.display()))?;
+            let manifest_doc: DocumentMut = manifest_content
+                .parse()
+                .with_context(|| format!("invalid TOML in {}", manifest_path.display()))?;
+
+            if let Some(mcps_table) = manifest_doc.get("mcps").and_then(|m| m.as_table()) {
                 for (name, item) in mcps_table.iter() {
                     let Some(tbl) = item.as_table() else {
                         continue;
@@ -279,7 +291,7 @@ impl AuthState {
     }
 
     fn save(&mut self) -> Result<()> {
-        let config_path = wcore::paths::CONFIG_DIR.join("crab.toml");
+        let config_path = wcore::paths::CONFIG_DIR.join(wcore::paths::CONFIG_FILE);
         std::fs::create_dir_all(&*wcore::paths::CONFIG_DIR)
             .with_context(|| format!("cannot create {}", wcore::paths::CONFIG_DIR.display()))?;
 
@@ -348,8 +360,31 @@ impl AuthState {
             doc.insert("gateway", Item::Table(gateway_table));
         }
 
-        // [mcps.*]
+        // Remove legacy [mcps] from config.toml if present.
         doc.remove("mcps");
+
+        std::fs::write(&config_path, doc.to_string())
+            .with_context(|| format!("failed to write {}", config_path.display()))?;
+
+        // Save MCPs to local/CrabTalk.toml.
+        let manifest_path = wcore::paths::CONFIG_DIR
+            .join(wcore::paths::LOCAL_DIR)
+            .join("CrabTalk.toml");
+        let local_dir = wcore::paths::CONFIG_DIR.join(wcore::paths::LOCAL_DIR);
+        std::fs::create_dir_all(&local_dir)
+            .with_context(|| format!("cannot create {}", local_dir.display()))?;
+
+        let manifest_content = if manifest_path.exists() {
+            std::fs::read_to_string(&manifest_path)
+                .with_context(|| format!("cannot read {}", manifest_path.display()))?
+        } else {
+            String::new()
+        };
+        let mut manifest_doc: DocumentMut = manifest_content
+            .parse()
+            .with_context(|| format!("invalid TOML in {}", manifest_path.display()))?;
+
+        manifest_doc.remove("mcps");
         if !self.mcps.is_empty() {
             let mut mcps_table = Table::new();
             for mcp in &self.mcps {
@@ -373,11 +408,11 @@ impl AuthState {
                 }
                 mcps_table.insert(&mcp.name, Item::Table(tbl));
             }
-            doc.insert("mcps", Item::Table(mcps_table));
+            manifest_doc.insert("mcps", Item::Table(mcps_table));
         }
 
-        std::fs::write(&config_path, doc.to_string())
-            .with_context(|| format!("failed to write {}", config_path.display()))?;
+        std::fs::write(&manifest_path, manifest_doc.to_string())
+            .with_context(|| format!("failed to write {}", manifest_path.display()))?;
 
         self.status = String::from("Saved!");
         Ok(())

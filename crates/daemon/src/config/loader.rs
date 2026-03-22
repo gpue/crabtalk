@@ -1,61 +1,158 @@
 //! Configuration loading and first-run scaffolding.
 //!
-//! Handles filesystem I/O: reads agent prompt directories and scaffolds the
-//! config directory structure on first run.
+//! Handles filesystem I/O: scaffolds the config directory structure on
+//! first run and migrates from old layouts. Manifest resolution and agent
+//! loading live in `wcore::config::manifest`.
 
 use anyhow::{Context, Result};
 use std::path::Path;
-use wcore::paths::{AGENTS_DIR, SKILLS_DIR};
+use wcore::paths::{AGENTS_DIR, CONFIG_FILE, LOCAL_DIR, PACKAGES_DIR, SKILLS_DIR};
 
-/// Default configuration template, embedded from the checked-in `crab.toml`.
-pub const DEFAULT_CONFIG: &str = include_str!("../../crab.toml");
-
-/// Load all agent markdown files from a directory as plain text.
-///
-/// Returns `(filename_stem, content)` pairs. Non-`.md` files are silently
-/// skipped. Entries are sorted by filename for deterministic ordering.
-/// Returns an empty vec if the directory does not exist.
-pub fn load_agents_dir(path: &Path) -> Result<Vec<(String, String)>> {
-    if !path.exists() {
-        tracing::warn!("agent directory does not exist: {}", path.display());
-        return Ok(Vec::new());
-    }
-
-    let mut entries: Vec<_> = std::fs::read_dir(path)?
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().is_some_and(|ext| ext == "md"))
-        .collect();
-    entries.sort_by_key(|e| e.file_name());
-
-    let mut agents = Vec::with_capacity(entries.len());
-    for entry in entries {
-        let stem = entry
-            .path()
-            .file_stem()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .into_owned();
-        let content = std::fs::read_to_string(entry.path())?;
-        agents.push((stem, content));
-    }
-
-    Ok(agents)
-}
+/// Default configuration template, embedded from the checked-in `config.toml`.
+pub const DEFAULT_CONFIG: &str = include_str!("../../config.toml");
 
 /// Scaffold the full config directory structure on first run.
 ///
-/// Creates subdirectories (agents, skills) and writes a default crab.toml.
+/// Runs migration for old layouts, then creates any missing directories
+/// and writes a default `config.toml`.
 pub fn scaffold_config_dir(config_dir: &Path) -> Result<()> {
+    migrate_layout(config_dir);
+
     std::fs::create_dir_all(config_dir.join(AGENTS_DIR))
         .context("failed to create agents directory")?;
     std::fs::create_dir_all(config_dir.join(SKILLS_DIR))
         .context("failed to create skills directory")?;
+    std::fs::create_dir_all(config_dir.join(PACKAGES_DIR))
+        .context("failed to create packages directory")?;
 
-    let config_toml = config_dir.join("crab.toml");
+    let config_toml = config_dir.join(CONFIG_FILE);
     if !config_toml.exists() {
         std::fs::write(&config_toml, DEFAULT_CONFIG)
             .with_context(|| format!("failed to write {}", config_toml.display()))?;
     }
 
     Ok(())
+}
+
+// ── Migration ───────────────────────────────────────────────────────
+
+/// Migrate from old config layouts to the new package-centric layout.
+///
+/// Phase 1: Renames `crab.toml` → `config.toml`, moves `skills/` and
+/// `agents/` under `local/`.
+///
+/// Phase 2: Extracts `[mcps.*]` and `[agents.*]` from `config.toml` into
+/// `local/CrabTalk.toml`.
+///
+/// Each step is a no-op if already migrated. Errors are logged, not fatal.
+fn migrate_layout(config_dir: &Path) {
+    // Phase 1: rename crab.toml → config.toml
+    let old_config = config_dir.join("crab.toml");
+    let new_config = config_dir.join(CONFIG_FILE);
+    if old_config.exists() && !new_config.exists() {
+        if let Err(e) = std::fs::rename(&old_config, &new_config) {
+            tracing::warn!("failed to rename crab.toml → config.toml: {e}");
+        } else {
+            tracing::info!("migrated crab.toml → config.toml");
+        }
+    }
+
+    let local_dir = config_dir.join(LOCAL_DIR);
+    let _ = std::fs::create_dir_all(&local_dir);
+
+    // Phase 1: move skills/ → local/skills/
+    let old_skills = config_dir.join("skills");
+    let new_skills = config_dir.join(SKILLS_DIR);
+    if old_skills.exists() && old_skills.is_dir() && !new_skills.exists() {
+        if let Err(e) = std::fs::rename(&old_skills, &new_skills) {
+            tracing::warn!("failed to move skills/ → local/skills/: {e}");
+        } else {
+            tracing::info!("migrated skills/ → local/skills/");
+        }
+    }
+
+    // Phase 1: move agents/ → local/agents/
+    let old_agents = config_dir.join("agents");
+    let new_agents = config_dir.join(AGENTS_DIR);
+    if old_agents.exists() && old_agents.is_dir() && !new_agents.exists() {
+        if let Err(e) = std::fs::rename(&old_agents, &new_agents) {
+            tracing::warn!("failed to move agents/ → local/agents/: {e}");
+        } else {
+            tracing::info!("migrated agents/ → local/agents/");
+        }
+    }
+
+    // Phase 2: extract [mcps] and [agents] from config.toml → local/CrabTalk.toml
+    let config_path = config_dir.join(CONFIG_FILE);
+    if config_path.exists() {
+        migrate_mcps_agents(&config_path, &local_dir.join("CrabTalk.toml"));
+    }
+}
+
+/// Extract `[mcps.*]` and `[agents.*]` sections from config.toml into
+/// `local/CrabTalk.toml`, removing them from config.toml.
+fn migrate_mcps_agents(config_path: &Path, manifest_path: &Path) {
+    use toml_edit::DocumentMut;
+
+    let Ok(content) = std::fs::read_to_string(config_path) else {
+        return;
+    };
+    let Ok(mut doc) = content.parse::<DocumentMut>() else {
+        return;
+    };
+
+    let has_mcps = doc
+        .get("mcps")
+        .and_then(|v| v.as_table())
+        .is_some_and(|t| !t.is_empty());
+    let has_agents = doc
+        .get("agents")
+        .and_then(|v| v.as_table())
+        .is_some_and(|t| !t.is_empty());
+
+    if !has_mcps && !has_agents {
+        return;
+    }
+
+    // Build or load the manifest document.
+    let mut manifest_doc = if manifest_path.exists() {
+        std::fs::read_to_string(manifest_path)
+            .ok()
+            .and_then(|s| s.parse::<DocumentMut>().ok())
+            .unwrap_or_default()
+    } else {
+        DocumentMut::default()
+    };
+
+    // Only migrate if manifest doesn't already have these sections.
+    if has_mcps
+        && manifest_doc
+            .get("mcps")
+            .and_then(|v| v.as_table())
+            .is_none_or(|t| t.is_empty())
+        && let Some(mcps) = doc.remove("mcps")
+    {
+        manifest_doc.insert("mcps", mcps);
+        tracing::info!("migrated [mcps] from config.toml → local/CrabTalk.toml");
+    }
+
+    if has_agents
+        && manifest_doc
+            .get("agents")
+            .and_then(|v| v.as_table())
+            .is_none_or(|t| t.is_empty())
+        && let Some(agents) = doc.remove("agents")
+    {
+        manifest_doc.insert("agents", agents);
+        tracing::info!("migrated [agents] from config.toml → local/CrabTalk.toml");
+    }
+
+    // Write both files back.
+    if let Err(e) = std::fs::write(manifest_path, manifest_doc.to_string()) {
+        tracing::warn!("failed to write local/CrabTalk.toml: {e}");
+        return;
+    }
+    if let Err(e) = std::fs::write(config_path, doc.to_string()) {
+        tracing::warn!("failed to update config.toml after migration: {e}");
+    }
 }
