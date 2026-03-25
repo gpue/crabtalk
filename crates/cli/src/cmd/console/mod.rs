@@ -14,22 +14,23 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Paragraph, Tabs},
 };
+use sessions::{SessionView, render_session_view};
 use std::collections::VecDeque;
 use tokio::sync::mpsc;
-use wcore::protocol::message::{AgentEventMsg, SessionInfo};
+use wcore::protocol::message::AgentEventMsg;
 
 mod events;
 mod sessions;
 
 use events::render_events;
-use sessions::render_sessions;
 
 /// Interactive console for sessions.
 #[derive(Args, Debug)]
 pub struct Console;
 
 impl Console {
-    pub async fn run(self, runner: Runner) -> Result<()> {
+    /// Run the console. Returns a file path if the user selected a conversation to resume.
+    pub async fn run(self, mut runner: Runner) -> Result<Option<std::path::PathBuf>> {
         // Spawn background event subscription task.
         let (event_tx, event_rx) = mpsc::unbounded_channel::<AgentEventMsg>();
         let socket_path = wcore::paths::SOCKET_PATH.to_path_buf();
@@ -46,23 +47,27 @@ impl Console {
             }
         });
 
-        // Show TUI immediately with empty sessions, load in background.
         let mut terminal = tui::setup()?;
+
+        // Fetch initial daemon session data.
+        let daemon_sessions = runner.list_sessions().await.unwrap_or_default();
+        let mut session_view = SessionView::default();
+        session_view.refresh_identities(&daemon_sessions);
+
         let mut state = ConsoleState {
-            sessions: Vec::new(),
-            selected: 0,
-            status: String::from("Loading..."),
+            status: String::from("Ready"),
             runner,
             tab: Tab::Sessions,
+            session_view,
+            daemon_sessions,
             events: VecDeque::new(),
             event_rx,
             event_scroll: 0,
         };
 
         let mut idle_ticks: u8 = 0;
-        let mut needs_refresh = true;
         let result = loop {
-            // Drain any pending events.
+            // Drain pending events.
             while let Ok(msg) = state.event_rx.try_recv() {
                 let timestamp = chrono::Local::now().format("%H:%M:%S").to_string();
                 state.events.push_back(EventEntry { timestamp, msg });
@@ -79,32 +84,22 @@ impl Console {
                 }
             } else {
                 idle_ticks = idle_ticks.saturating_add(1);
-                if needs_refresh || idle_ticks >= 4 {
+                // Refresh daemon data every ~2s (8 × 250ms poll).
+                if idle_ticks >= 8 {
                     idle_ticks = 0;
-                    needs_refresh = false;
-                    // Non-blocking refresh: timeout after 500ms to avoid freezing.
-                    let fut = state.runner.list_sessions();
-                    match tokio::time::timeout(std::time::Duration::from_millis(500), fut).await {
-                        Ok(Ok(sessions)) => {
-                            state.sessions = sessions;
-                            if state.selected >= state.sessions.len() {
-                                state.selected = state.sessions.len().saturating_sub(1);
-                            }
-                            state.status = String::from("Ready");
-                        }
-                        Ok(Err(_)) => {
-                            state.status = String::from("Error refreshing");
-                        }
-                        Err(_) => {
-                            // Timeout — don't block the TUI.
-                        }
+                    let timeout = std::time::Duration::from_millis(500);
+                    if let Ok(Ok(sessions)) =
+                        tokio::time::timeout(timeout, state.runner.list_sessions()).await
+                    {
+                        state.daemon_sessions = sessions;
+                        state.session_view.merge_daemon_data(&state.daemon_sessions);
                     }
                 }
             }
         };
 
         tui::teardown(&mut terminal)?;
-        result
+        Ok(result)
     }
 }
 
@@ -117,30 +112,29 @@ enum Tab {
 }
 
 pub(crate) struct ConsoleState {
-    pub(crate) sessions: Vec<SessionInfo>,
-    pub(crate) selected: usize,
     pub(crate) status: String,
     pub(crate) runner: Runner,
     tab: Tab,
+    session_view: SessionView,
+    daemon_sessions: Vec<wcore::protocol::message::SessionInfo>,
     events: VecDeque<EventEntry>,
     event_rx: mpsc::UnboundedReceiver<AgentEventMsg>,
     event_scroll: usize,
 }
 
-impl ConsoleState {}
-
 // ── Key handling ────────────────────────────────────────────────────
 
+/// Returns `Some(None)` to quit, `Some(Some(path))` to resume a conversation.
 async fn handle_key(
     key: crossterm::event::KeyEvent,
     state: &mut ConsoleState,
-) -> Result<Option<Result<()>>> {
+) -> Result<Option<Option<std::path::PathBuf>>> {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-        return Ok(Some(Ok(())));
+        return Ok(Some(None));
     }
 
     match key.code {
-        KeyCode::Char('q') => return Ok(Some(Ok(()))),
+        KeyCode::Char('q') => return Ok(Some(None)),
         KeyCode::Tab => {
             state.tab = match state.tab {
                 Tab::Sessions => Tab::Events,
@@ -148,51 +142,60 @@ async fn handle_key(
             };
         }
         _ => match state.tab {
-            Tab::Sessions => handle_sessions_key(key.code, state).await,
+            Tab::Sessions => {
+                if let Some(path) = handle_sessions_key(key.code, state).await {
+                    return Ok(Some(Some(path)));
+                }
+            }
             Tab::Events => handle_events_key(key.code, state),
         },
     }
     Ok(None)
 }
 
-async fn handle_sessions_key(code: KeyCode, state: &mut ConsoleState) {
-    let timeout = std::time::Duration::from_millis(500);
-    let len = state.sessions.len();
+async fn handle_sessions_key(
+    code: KeyCode,
+    state: &mut ConsoleState,
+) -> Option<std::path::PathBuf> {
     match code {
         KeyCode::Up | KeyCode::Char('k') => {
-            state.selected = state.selected.saturating_sub(1);
+            state.session_view.move_up();
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            if len > 0 && state.selected < len - 1 {
-                state.selected += 1;
+            state.session_view.move_down();
+        }
+        KeyCode::Enter => {
+            // In conversation view: select and return the file path to resume.
+            if let Some(path) = state.session_view.selected_file() {
+                return Some(path);
             }
+            // In identity view: drill down.
+            let timeout = std::time::Duration::from_millis(500);
+            if let Ok(Ok(sessions)) =
+                tokio::time::timeout(timeout, state.runner.list_sessions()).await
+            {
+                state.daemon_sessions = sessions;
+            }
+            state.session_view.enter(&state.daemon_sessions);
+        }
+        KeyCode::Esc => {
+            state.session_view.back(&state.daemon_sessions);
         }
         KeyCode::Char('r') => {
+            let timeout = std::time::Duration::from_millis(500);
             if let Ok(Ok(sessions)) =
                 tokio::time::timeout(timeout, state.runner.list_sessions()).await
             {
-                state.sessions = sessions;
-                state.status = String::from("Refreshed");
+                state.daemon_sessions = sessions;
             }
-        }
-        KeyCode::Char('d') | KeyCode::Delete => {
-            if let Some(s) = state.sessions.get(state.selected) {
-                let id = s.id;
-                match tokio::time::timeout(timeout, state.runner.kill_session(id)).await {
-                    Ok(Ok(true)) => state.status = format!("Session {id} killed"),
-                    Ok(Ok(false)) => state.status = format!("Session {id} not found"),
-                    Ok(Err(e)) => state.status = format!("Error: {e}"),
-                    Err(_) => state.status = String::from("Timeout"),
-                }
-            }
-            if let Ok(Ok(sessions)) =
-                tokio::time::timeout(timeout, state.runner.list_sessions()).await
-            {
-                state.sessions = sessions;
-            }
+            state
+                .session_view
+                .refresh_identities(&state.daemon_sessions);
+            state.status = String::from("Refreshed");
         }
         _ => {}
     }
+    None
 }
 
 fn handle_events_key(code: KeyCode, state: &mut ConsoleState) {
@@ -239,7 +242,7 @@ fn render(frame: &mut Frame, state: &ConsoleState) {
 
     // Content
     match state.tab {
-        Tab::Sessions => render_sessions(frame, state, chunks[1]),
+        Tab::Sessions => render_session_view(frame, &state.session_view, chunks[1]),
         Tab::Events => {
             let events: Vec<&EventEntry> = state.events.iter().collect();
             render_events(frame, &events, state.event_scroll, chunks[1]);
@@ -255,12 +258,13 @@ fn render_help_bar(frame: &mut Frame, state: &ConsoleState, area: Rect) {
     let mut spans = vec![Span::styled(" j/k ", key_style), Span::raw("Navigate  ")];
 
     if state.tab == Tab::Sessions {
-        spans.extend([
-            Span::styled("d ", key_style),
-            Span::raw("Kill  "),
-            Span::styled("r ", key_style),
-            Span::raw("Refresh  "),
-        ]);
+        let in_conversations = matches!(state.session_view, SessionView::Conversations { .. });
+        if in_conversations {
+            spans.extend([Span::styled("Esc ", key_style), Span::raw("Back  ")]);
+        } else {
+            spans.extend([Span::styled("Enter ", key_style), Span::raw("Open  ")]);
+        }
+        spans.extend([Span::styled("r ", key_style), Span::raw("Refresh  ")]);
     }
 
     spans.extend([

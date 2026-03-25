@@ -137,14 +137,16 @@ impl<M: Model + Send + Sync + Clone + 'static, H: Hook + 'static> Runtime<M, H> 
             }
         }
 
-        // 2. Disk lookup.
-        let path = session::session_file_path(&crate::paths::SESSIONS_DIR, agent, created_by);
-        if path.exists()
-            && let Ok((_, messages)) = Session::load_context(&path)
+        // 2. Disk lookup — find latest session file for this identity.
+        if let Some(path) =
+            session::find_latest_session(&crate::paths::SESSIONS_DIR, agent, created_by)
+            && let Ok((meta, messages)) = Session::load_context(&path)
         {
             let id = self.next_session_id.fetch_add(1, Ordering::Relaxed);
             let mut session = Session::new(id, agent, created_by);
             session.history = messages;
+            session.title = meta.title;
+            session.uptime_secs = meta.uptime_secs;
             session.file_path = Some(path);
             self.sessions
                 .write()
@@ -165,6 +167,25 @@ impl<M: Model + Send + Sync + Clone + 'static, H: Hook + 'static> Runtime<M, H> 
         let id = self.next_session_id.fetch_add(1, Ordering::Relaxed);
         let mut session = Session::new(id, agent, created_by);
         session.init_file(&crate::paths::SESSIONS_DIR);
+        self.sessions
+            .write()
+            .await
+            .insert(id, Arc::new(Mutex::new(session)));
+        Ok(id)
+    }
+
+    /// Load a specific session from a file path. Returns the session ID.
+    pub async fn load_specific_session(&self, file_path: &std::path::Path) -> Result<u64> {
+        let (meta, messages) = Session::load_context(file_path)?;
+        if !self.agents.contains_key(&meta.agent) {
+            bail!("agent '{}' not registered", meta.agent);
+        }
+        let id = self.next_session_id.fetch_add(1, Ordering::Relaxed);
+        let mut session = Session::new(id, &meta.agent, &meta.created_by);
+        session.history = messages;
+        session.title = meta.title;
+        session.uptime_secs = meta.uptime_secs;
+        session.file_path = Some(file_path.to_path_buf());
         self.sessions
             .write()
             .await
@@ -204,6 +225,63 @@ impl<M: Model + Send + Sync + Clone + 'static, H: Hook + 'static> Runtime<M, H> 
         }
         let next = self.next_session_id.load(Ordering::Relaxed);
         dest.next_session_id.store(next, Ordering::Relaxed);
+    }
+
+    /// Spawn a background task to generate a conversation title from the
+    /// first user+assistant exchange. Non-blocking — the main flow continues.
+    fn spawn_title_generation(&self, _session_id: u64, session_mutex: Arc<Mutex<Session>>) {
+        let model = self.model.clone();
+        tokio::spawn(async move {
+            let (user_msg, assistant_msg) = {
+                let session = session_mutex.lock().await;
+                let user = session
+                    .history
+                    .iter()
+                    .find(|m| m.role == crate::model::Role::User && !m.auto_injected)
+                    .map(|m| m.content.clone());
+                let assistant = session
+                    .history
+                    .iter()
+                    .find(|m| m.role == crate::model::Role::Assistant)
+                    .map(|m| m.content.clone());
+                (user, assistant)
+            };
+
+            let Some(user) = user_msg else { return };
+            let Some(assistant) = assistant_msg else {
+                return;
+            };
+
+            // Truncate to keep the title-generation request small.
+            let user_snippet: String = user.chars().take(200).collect();
+            let assistant_snippet: String = assistant.chars().take(200).collect();
+
+            let prompt = format!(
+                "Summarize this conversation in 3-6 words as a short title. \
+                 Return ONLY the title, nothing else.\n\n\
+                 User: {user_snippet}\nAssistant: {assistant_snippet}"
+            );
+
+            let request = crate::model::Request::new(model.active_model())
+                .with_messages(vec![Message::user(&prompt)]);
+
+            match model.send(&request).await {
+                Ok(response) => {
+                    if let Some(title) = response.content() {
+                        let title = title.trim().trim_matches('"').to_string();
+                        if !title.is_empty() {
+                            let mut session = session_mutex.lock().await;
+                            if session.title.is_empty() {
+                                session.set_title(&title);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!("title generation failed: {e}");
+                }
+            }
+        });
     }
 
     // --- Execution ---
@@ -260,9 +338,11 @@ impl<M: Model + Send + Sync + Clone + 'static, H: Hook + 'static> Runtime<M, H> 
             .ok_or_else(|| anyhow::anyhow!("agent '{}' not registered", session.agent))?;
 
         let (tx, mut rx) = mpsc::unbounded_channel();
+        let run_start = std::time::Instant::now();
         self.active_sessions.write().await.insert(session_id);
         let response = agent_ref.run(&mut session.history, tx, None).await;
         self.active_sessions.write().await.remove(&session_id);
+        session.uptime_secs += run_start.elapsed().as_secs();
 
         // Drain events, stash compact summary if one occurred.
         let mut compact_summary: Option<String> = None;
@@ -284,6 +364,14 @@ impl<M: Model + Send + Sync + Clone + 'static, H: Hook + 'static> Runtime<M, H> 
         } else {
             // No compaction: append new messages since pre_run.
             session.append_messages(&session.history[pre_run_len..]);
+        }
+
+        // Persist updated uptime to meta line.
+        session.rewrite_meta();
+
+        // Generate title in background if this is the first exchange.
+        if session.title.is_empty() && session.history.len() >= 2 {
+            self.spawn_title_generation(session_id, session_mutex.clone());
         }
         Ok(response)
     }
@@ -339,8 +427,10 @@ impl<M: Model + Send + Sync + Clone + 'static, H: Hook + 'static> Runtime<M, H> 
                 }
             };
 
+            let run_start = std::time::Instant::now();
             self.active_sessions.write().await.insert(session_id);
             let mut compact_summary: Option<String> = None;
+            let mut done_event: Option<AgentEvent> = None;
             {
                 let mut event_stream = std::pin::pin!(agent_ref.run_stream(&mut session.history, Some(session_id)));
                 while let Some(event) = event_stream.next().await {
@@ -348,12 +438,17 @@ impl<M: Model + Send + Sync + Clone + 'static, H: Hook + 'static> Runtime<M, H> 
                         compact_summary = Some(summary.clone());
                     }
                     self.hook.on_event(&agent_name, session_id, &event);
-                    yield event;
+                    // Hold back Done — yield it after persistence.
+                    if matches!(event, AgentEvent::Done(_)) {
+                        done_event = Some(event);
+                    } else {
+                        yield event;
+                    }
                 }
             }
+            // Borrow on session.history is released. Persist now.
             self.active_sessions.write().await.remove(&session_id);
-
-            // Append-only persistence.
+            session.uptime_secs += run_start.elapsed().as_secs();
             if let Some(summary) = compact_summary {
                 session.append_compact(&summary);
                 if session.history.len() > 1 {
@@ -361,6 +456,17 @@ impl<M: Model + Send + Sync + Clone + 'static, H: Hook + 'static> Runtime<M, H> 
                 }
             } else {
                 session.append_messages(&session.history[pre_run_len..]);
+            }
+            // Persist updated uptime to meta line.
+            session.rewrite_meta();
+
+            // Generate title in background if this is the first exchange.
+            if session.title.is_empty() && session.history.len() >= 2 {
+                self.spawn_title_generation(session_id, session_mutex.clone());
+            }
+            // Now yield Done.
+            if let Some(event) = done_event {
+                yield event;
             }
         }
     }

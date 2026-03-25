@@ -3,7 +3,7 @@
 use crate::repl::{
     command::{SlashResult, handle_slash},
     input::{History, InputResult},
-    render::{MarkdownRenderer, styled_prompt, welcome_banner},
+    render::{MarkdownRenderer, welcome_banner},
     runner::{ConnectionInfo, OutputChunk, Runner, send_reply},
 };
 use anyhow::Result;
@@ -49,12 +49,34 @@ impl ChatRepl {
         println!("{}", welcome_banner(model.as_deref()));
         println!();
 
-        let prompt = styled_prompt(&self.agent);
+        let agent_name = self.agent.clone();
+        let mut new_chat = false;
+        let mut resume_file: Option<String> = None;
+        let mut chat_title = String::new();
+
+        // Load title from the latest session file if it exists.
+        if let Some(path) =
+            wcore::find_latest_session(&wcore::paths::SESSIONS_DIR, &self.agent, "user")
+            && let Ok((meta, _)) = wcore::Session::load_context(&path)
+        {
+            chat_title = meta.title;
+        }
+
         loop {
-            let line = match input::read_line(&prompt, &mut self.history) {
+            let line = match input::read_line(&agent_name, &mut self.history, &chat_title) {
                 InputResult::Line(line) => line,
                 InputResult::Interrupt => continue,
                 InputResult::Eof => break,
+                InputResult::ClearScreen => {
+                    let _ = crossterm::execute!(
+                        std::io::stdout(),
+                        crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+                        crossterm::cursor::MoveTo(0, 0),
+                    );
+                    println!("{}", render::welcome_banner(None));
+                    println!();
+                    continue;
+                }
             };
             if line.is_empty() {
                 continue;
@@ -69,11 +91,44 @@ impl ChatRepl {
                     cmd
                 }
                 SlashResult::Exit => break,
+                SlashResult::Resume => {
+                    // Run the session console inline.
+                    let console = crate::cmd::console::Console;
+                    let socket_path = wcore::paths::SOCKET_PATH.to_path_buf();
+                    if let Ok(runner) = runner::Runner::connect(&socket_path).await
+                        && let Ok(Some(path)) = console.run(runner).await
+                    {
+                        resume_file = Some(path.to_string_lossy().into_owned());
+                        println!(
+                            "Resumed: {}",
+                            console::style(path.file_name().unwrap_or_default().to_string_lossy())
+                                .dim()
+                        );
+                    }
+                    continue;
+                }
+                SlashResult::Clear => {
+                    new_chat = true;
+                    // Clear the screen and move cursor to top.
+                    let _ = crossterm::execute!(
+                        std::io::stdout(),
+                        crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+                        crossterm::cursor::MoveTo(0, 0),
+                    );
+                    println!("{}", render::welcome_banner(None));
+                    println!();
+                    continue;
+                }
             };
+            // Echo user input with gray background.
+            println!("\x1b[48;5;236m {} \x1b[0m", content);
             println!();
             let conn_info = self.runner.conn_info().clone();
-            let stream = self.runner.stream(&self.agent, &content, None);
+            let stream =
+                self.runner
+                    .stream(&self.agent, &content, None, new_chat, resume_file.take());
             stream_to_terminal(stream, &conn_info).await?;
+            new_chat = false;
             println!();
         }
 
@@ -151,6 +206,7 @@ pub(crate) async fn stream_to_terminal(
                                 }
                                 // Reset renderer — the ask TUI took over the terminal,
                                 // so cursor tracking in the old renderer is invalid.
+                                println!();
                                 renderer = MarkdownRenderer::new();
                                 // Skip the ask_user tool result echo.
                                 skip_tool_result += 1;

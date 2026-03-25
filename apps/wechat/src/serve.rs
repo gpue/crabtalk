@@ -224,6 +224,8 @@ async fn wx_stream(
         session,
         sender: Some(sender.to_string()),
         cwd: None,
+        new_chat: false,
+        resume_file: None,
     });
     let mut server_rx = client.send(client_msg).await;
     let mut acc = StreamAccumulator::new();

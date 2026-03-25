@@ -123,6 +123,8 @@ impl Runner {
         agent: &'a str,
         content: &'a str,
         cwd: Option<&'a Path>,
+        new_chat: bool,
+        resume_file: Option<String>,
     ) -> impl Stream<Item = Result<OutputChunk>> + Send + 'a {
         let cwd = cwd.map(|p| p.to_string_lossy().into_owned()).or_else(|| {
             std::env::current_dir()
@@ -136,6 +138,8 @@ impl Runner {
                 session: None,
                 sender: None,
                 cwd,
+                new_chat,
+                resume_file,
             }))
             .take_while(|r| {
                 std::future::ready(!matches!(
