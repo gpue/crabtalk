@@ -131,9 +131,13 @@ impl RuntimeBridge for DaemonBridge {
                     .collect();
                 (AgentEventKind::ToolStart, labels.join(", "))
             }
-            AgentEvent::ToolResult { call_id, .. } => {
-                tracing::debug!(%agent, %call_id, "agent tool result");
-                (AgentEventKind::ToolResult, call_id.clone())
+            AgentEvent::ToolResult {
+                call_id,
+                duration_ms,
+                ..
+            } => {
+                tracing::debug!(%agent, %call_id, %duration_ms, "agent tool result");
+                (AgentEventKind::ToolResult, format!("{duration_ms}ms"))
             }
             AgentEvent::ToolCallsComplete => {
                 tracing::debug!(%agent, "agent tool calls complete");
@@ -158,6 +162,7 @@ impl RuntimeBridge for DaemonBridge {
             session: session_id,
             kind: kind.into(),
             content,
+            timestamp: chrono::Utc::now().to_rfc3339(),
         });
     }
 }

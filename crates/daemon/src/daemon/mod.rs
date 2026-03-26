@@ -6,6 +6,7 @@
 
 use crate::{
     DaemonConfig,
+    cron::CronStore,
     daemon::event::{DaemonEvent, DaemonEventSender},
     hook::DaemonHook,
 };
@@ -16,7 +17,7 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
-use tokio::sync::{RwLock, broadcast, mpsc, oneshot};
+use tokio::sync::{Mutex, RwLock, broadcast, mpsc, oneshot};
 use wcore::Runtime;
 
 pub(crate) mod builder;
@@ -38,6 +39,10 @@ pub struct Daemon {
     /// so agents can dispatch tool calls. Stored here so [`Daemon::reload`] can
     /// pass a fresh clone into the rebuilt runtime.
     pub(crate) event_tx: DaemonEventSender,
+    /// When the daemon was started (for uptime calculation).
+    pub(crate) started_at: std::time::Instant,
+    /// Daemon-level cron scheduler. Survives runtime reloads.
+    pub(crate) crons: Arc<Mutex<CronStore>>,
 }
 
 impl Daemon {
@@ -53,7 +58,6 @@ impl Daemon {
         tracing::info!("loaded configuration from {}", config_path.display());
 
         let (event_tx, event_rx) = mpsc::unbounded_channel::<DaemonEvent>();
-        let daemon = Daemon::build(&config, config_dir, event_tx.clone()).await?;
 
         // Broadcast shutdown — all subsystems subscribe.
         let (shutdown_tx, _) = broadcast::channel::<()>(1);
@@ -64,38 +68,8 @@ impl Daemon {
             let _ = shutdown_event_tx.send(DaemonEvent::Shutdown);
         });
 
-        // Per-agent heartbeat timers — only agents with interval > 0 run.
-        for (name, agent) in &config.agents {
-            if agent.heartbeat.interval == 0 {
-                continue;
-            }
-            let agent_name = name.clone();
-            let heartbeat_tx = event_tx.clone();
-            let mut heartbeat_shutdown = shutdown_tx.subscribe();
-            let interval_secs = agent.heartbeat.interval * 60;
-            tokio::spawn(async move {
-                let mut tick = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
-                tick.tick().await; // skip the immediate first tick
-                loop {
-                    tokio::select! {
-                        _ = tick.tick() => {
-                            let event = DaemonEvent::Heartbeat {
-                                agent: agent_name.clone(),
-                            };
-                            if heartbeat_tx.send(event).is_err() {
-                                break;
-                            }
-                        }
-                        _ = heartbeat_shutdown.recv() => break,
-                    }
-                }
-            });
-            tracing::info!(
-                "heartbeat timer started for '{}' (interval: {}m)",
-                name,
-                agent.heartbeat.interval,
-            );
-        }
+        let daemon =
+            Daemon::build(&config, config_dir, event_tx.clone(), shutdown_tx.clone()).await?;
 
         let d = daemon.clone();
         let event_loop_join = tokio::spawn(async move {
