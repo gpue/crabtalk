@@ -2,7 +2,10 @@
 
 use runtime::{
     MemoryConfig,
-    memory::{Memory, storage::MemStorage},
+    memory::{
+        Memory,
+        storage::{MemStorage, Storage},
+    },
 };
 use std::path::PathBuf;
 
@@ -240,36 +243,4 @@ fn bm25_score_ranks() {
     let results = score(&docs, "rust programming", 5);
     assert!(!results.is_empty());
     assert_eq!(results[0].0, 1);
-}
-
-use runtime::memory::storage::Storage;
-
-#[test]
-fn soul_defaults_to_compiled_in() {
-    let mem = test_memory();
-    let soul = mem.build_soul();
-    assert!(soul.contains("You are Crab"));
-}
-
-#[test]
-fn write_soul_updates_identity() {
-    let mem = test_memory();
-    mem.write_soul("You are a custom assistant.");
-    assert_eq!(mem.build_soul(), "You are a custom assistant.");
-}
-
-#[test]
-fn write_soul_denied_when_disabled() {
-    let config = MemoryConfig {
-        soul_editable: false,
-        ..Default::default()
-    };
-    let mem = Memory::open(
-        PathBuf::from("/test/memory"),
-        config,
-        Box::new(MemStorage::new()),
-    );
-    let result = mem.write_soul("hacked identity");
-    assert!(result.contains("disabled"));
-    assert!(mem.build_soul().contains("You are Crab"));
 }

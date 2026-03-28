@@ -8,7 +8,10 @@
 use crate::{
     bridge::RuntimeBridge, mcp::McpHandler, memory::Memory, os, skill, skill::SkillHandler,
 };
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
 use wcore::{AgentConfig, AgentEvent, Hook, ToolRegistry, model::Message};
 
 /// Per-agent scope for dispatch enforcement. Empty vecs = unrestricted.
@@ -330,6 +333,11 @@ impl<B: RuntimeBridge + 'static> Hook for RuntimeHook<B> {
         ));
         cwd_msg.auto_injected = true;
         messages.push(cwd_msg);
+        if let Some(instructions) = discover_instructions(&cwd) {
+            let mut msg = Message::user(format!("<instructions>\n{instructions}\n</instructions>"));
+            msg.auto_injected = true;
+            messages.push(msg);
+        }
         messages
     }
 
@@ -347,4 +355,42 @@ impl<B: RuntimeBridge + 'static> Hook for RuntimeHook<B> {
     fn on_event(&self, agent: &str, session_id: u64, event: &AgentEvent) {
         self.bridge.on_agent_event(agent, session_id, event);
     }
+}
+
+/// Collect layered `Crab.md` instructions: global (`~/.crabtalk/Crab.md`)
+/// first, then any `Crab.md` files found walking up from `cwd` (root-first,
+/// project-last so project instructions take precedence).
+fn discover_instructions(cwd: &Path) -> Option<String> {
+    let config_dir = &*wcore::paths::CONFIG_DIR;
+    let mut layers = Vec::new();
+
+    // Global instructions from config dir.
+    let global = config_dir.join("Crab.md");
+    if let Ok(content) = std::fs::read_to_string(&global) {
+        layers.push(content);
+    }
+
+    // Walk up from CWD collecting project Crab.md files.
+    let mut found = Vec::new();
+    let mut dir = cwd;
+    loop {
+        let candidate = dir.join("Crab.md");
+        if candidate.is_file()
+            && !candidate.starts_with(config_dir)
+            && let Ok(content) = std::fs::read_to_string(&candidate)
+        {
+            found.push(content);
+        }
+        match dir.parent() {
+            Some(p) => dir = p,
+            None => break,
+        }
+    }
+    found.reverse();
+    layers.extend(found);
+
+    if layers.is_empty() {
+        return None;
+    }
+    Some(layers.join("\n\n"))
 }
