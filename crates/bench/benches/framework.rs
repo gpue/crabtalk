@@ -1,19 +1,21 @@
 //! Cross-framework benchmark — same tasks, same mock MCP, different agent runtimes.
 //!
 //! Prerequisites:
-//! 1. Mock MCP server: `cargo run -p crabtalk-bench --bin mock-mcp`
-//! 2. Local LLM via ollama (fixed model version)
-//! 3. All frameworks running and connected to mock MCP + same LLM:
-//!    - crabtalk daemon (port 6688)
-//!    - OpenClaw (port 18789)
-//!    - OpenCode (port 4096, via `opencode serve`)
-//!    - Hermes Agent (port 8080)
+//! 1. Local LLM via ollama (fixed model version)
+//! 2. Frameworks running and connected to mock MCP + same LLM.
+//!    Mock MCP is started in-process automatically.
+//!    Unreachable frameworks are skipped with a warning.
+//!
+//! Ports are configurable via env vars:
+//!   MOCK_MCP_PORT (default: 0 = random), CRABTALK_PORT (6688),
+//!   OPENCLAW_PORT (18789), OPENCODE_PORT (4096), HERMES_PORT (8080)
 
 use crabtalk_bench::{
     gateway::{
         Gateway, check_reachable, crabtalk::CrabtalkGateway, hermes::HermesGateway,
         openclaw::OpenClawGateway, opencode::OpenCodeGateway,
     },
+    mock_mcp,
     task::tasks,
 };
 use criterion::{Criterion, criterion_group, criterion_main};
@@ -30,6 +32,11 @@ fn bench_framework(c: &mut Criterion) {
         .enable_all()
         .build()
         .unwrap();
+
+    let task_defs = tasks();
+    let mcp_port = env_port("MOCK_MCP_PORT", 0);
+    let mcp_handle = rt.block_on(mock_mcp::start(mcp_port, &task_defs));
+    eprintln!("mock MCP listening at http://{}/mcp", mcp_handle.addr());
 
     let all_gateways: Vec<(&str, u16, Box<dyn Gateway>)> = vec![
         {
@@ -73,7 +80,7 @@ fn bench_framework(c: &mut Criterion) {
         return;
     }
 
-    for task in tasks() {
+    for task in &task_defs {
         let mut group = c.benchmark_group(task.name);
         // These are real LLM calls — use fewer samples and longer measurement.
         group.sample_size(10);
@@ -81,11 +88,17 @@ fn bench_framework(c: &mut Criterion) {
 
         for (name, _, gw) in &gateways {
             group.bench_function(*name, |b| {
-                b.iter(|| gw.run_task(&rt, &task));
+                // Mock MCP state isn't reset between iterations — after the first
+                // iteration exhausts scripted responses, subsequent ones always get
+                // the last response. This is fine for latency measurement; the
+                // validation pass (Phase 3) tests correctness separately.
+                b.iter(|| gw.run_task(&rt, task));
             });
         }
         group.finish();
     }
+
+    rt.block_on(mcp_handle.shutdown());
 }
 
 criterion_group!(benches, bench_framework);

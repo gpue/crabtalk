@@ -25,7 +25,7 @@ pub struct ToolCallRecord {
 struct MockState {
     tools: Value,
     responses: HashMap<String, Vec<ResponseEntry>>,
-    call_counts: Mutex<HashMap<String, usize>>,
+    call_counts: Arc<Mutex<HashMap<String, usize>>>,
     records: Arc<Mutex<Vec<ToolCallRecord>>>,
 }
 
@@ -38,6 +38,7 @@ struct ResponseEntry {
 pub struct MockMcpHandle {
     addr: SocketAddr,
     records: Arc<Mutex<Vec<ToolCallRecord>>>,
+    call_counts: Arc<Mutex<HashMap<String, usize>>>,
     shutdown: tokio::sync::oneshot::Sender<()>,
 }
 
@@ -52,9 +53,10 @@ impl MockMcpHandle {
         self.records.lock().unwrap().clone()
     }
 
-    /// Reset metrics between benchmark iterations.
-    pub fn reset_metrics(&self) {
+    /// Reset metrics and call counts between tasks.
+    pub fn reset(&self) {
         self.records.lock().unwrap().clear();
+        self.call_counts.lock().unwrap().clear();
     }
 
     /// Shut down the server.
@@ -63,13 +65,8 @@ impl MockMcpHandle {
     }
 }
 
-/// Start the mock MCP server on a random port.
-pub async fn start(tasks: &[Task]) -> (SocketAddr, MockMcpHandle) {
-    start_on(0, tasks).await
-}
-
 /// Start the mock MCP server on a specific port (0 = random).
-pub async fn start_on(port: u16, tasks: &[Task]) -> (SocketAddr, MockMcpHandle) {
+pub async fn start(port: u16, tasks: &[Task]) -> MockMcpHandle {
     let mut tool_schemas = Vec::new();
     let mut responses: HashMap<String, Vec<ResponseEntry>> = HashMap::new();
 
@@ -96,10 +93,11 @@ pub async fn start_on(port: u16, tasks: &[Task]) -> (SocketAddr, MockMcpHandle) 
     }
 
     let records = Arc::new(Mutex::new(Vec::new()));
+    let call_counts = Arc::new(Mutex::new(HashMap::new()));
     let state = Arc::new(MockState {
         tools: json!({ "tools": tool_schemas }),
         responses,
-        call_counts: Mutex::new(HashMap::new()),
+        call_counts: Arc::clone(&call_counts),
         records: Arc::clone(&records),
     });
 
@@ -122,12 +120,12 @@ pub async fn start_on(port: u16, tasks: &[Task]) -> (SocketAddr, MockMcpHandle) 
             .unwrap();
     });
 
-    let handle = MockMcpHandle {
+    MockMcpHandle {
         addr,
         records,
+        call_counts,
         shutdown: shutdown_tx,
-    };
-    (addr, handle)
+    }
 }
 
 async fn handle_mcp(

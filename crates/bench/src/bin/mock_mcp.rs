@@ -14,7 +14,8 @@ async fn main() {
         .unwrap_or(0);
 
     let tasks = task::tasks();
-    let (addr, _handle) = mock_mcp::start_on(port, &tasks).await;
+    let handle = mock_mcp::start(port, &tasks).await;
+    let addr = handle.addr();
     eprintln!("mock MCP server listening on http://{addr}/mcp");
     eprintln!(
         "tools: {}",
