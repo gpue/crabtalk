@@ -560,6 +560,7 @@ dependencies = [
  "crabtalk-transport",
  "criterion",
  "futures-util",
+ "libc",
  "prost",
  "reqwest 0.13.2",
  "serde",
