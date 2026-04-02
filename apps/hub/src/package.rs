@@ -23,6 +23,7 @@ pub async fn install(
     path: Option<&Path>,
     force: bool,
     on_step: impl Fn(&str),
+    on_output: impl Fn(&str),
 ) -> Result<()> {
     let (scope, name) = parse_package(package)?;
 
@@ -111,12 +112,12 @@ pub async fn install(
         loop {
             tokio::select! {
                 line = stdout_lines.next_line() => match line {
-                    Ok(Some(line)) => on_step(&line),
+                    Ok(Some(line)) => on_output(&line),
                     Ok(None) => break,
                     Err(_) => break,
                 },
                 line = stderr_lines.next_line() => match line {
-                    Ok(Some(line)) => on_step(&line),
+                    Ok(Some(line)) => on_output(&line),
                     Ok(None) => {}
                     Err(_) => {}
                 },
@@ -265,6 +266,110 @@ pub async fn git_sync(url: &str, dest: &Path, branch: Option<&str>) -> Result<()
         anyhow::ensure!(status.success(), "git clone exited with {status}");
     }
     Ok(())
+}
+
+/// Info about a hub package returned by [`search_hub`].
+pub struct HubPackageEntry {
+    /// Package identifier (`scope/name`).
+    pub name: String,
+    /// Human-readable description.
+    pub description: String,
+    /// Number of skills in the package.
+    pub skill_count: u32,
+    /// Number of MCP servers in the package.
+    pub mcp_count: u32,
+    /// Whether the package is installed locally.
+    pub installed: bool,
+    /// Source repository URL.
+    pub repository: String,
+}
+
+/// Search the hub for packages matching the query.
+///
+/// Syncs the hub repo, scans all `.toml` manifests, and returns matching
+/// packages. An empty query returns all packages.
+pub async fn search_hub(query: &str) -> Result<Vec<HubPackageEntry>> {
+    let hub_dir = CONFIG_DIR.join("hub");
+    git_sync(CRABTALK_HUB, &hub_dir, None)
+        .await
+        .context("failed to sync hub repo")?;
+
+    let packages_dir = CONFIG_DIR.join(wcore::paths::PACKAGES_DIR);
+    let query_lower = query.to_lowercase();
+    let mut results = Vec::new();
+
+    // Scan scope directories in the hub.
+    let Ok(scopes) = std::fs::read_dir(&hub_dir) else {
+        return Ok(results);
+    };
+    for scope_entry in scopes.flatten() {
+        let scope_path = scope_entry.path();
+        if !scope_path.is_dir() {
+            continue;
+        }
+        let scope = scope_entry.file_name().to_string_lossy().to_string();
+        if scope.starts_with('.') {
+            continue;
+        }
+
+        let Ok(manifests) = std::fs::read_dir(&scope_path) else {
+            continue;
+        };
+        for manifest_entry in manifests.flatten() {
+            let path = manifest_entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+                continue;
+            }
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(manifest) = toml::from_str::<manifest::Manifest>(&content) else {
+                continue;
+            };
+
+            let pkg_name = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default();
+            let full_name = format!("{scope}/{pkg_name}");
+
+            // Filter by query (match name, description, or keywords).
+            if !query_lower.is_empty() {
+                let matches = full_name.to_lowercase().contains(&query_lower)
+                    || manifest
+                        .package
+                        .description
+                        .to_lowercase()
+                        .contains(&query_lower)
+                    || manifest
+                        .package
+                        .keywords
+                        .iter()
+                        .any(|k| k.to_lowercase().contains(&query_lower));
+                if !matches {
+                    continue;
+                }
+            }
+
+            let installed = packages_dir
+                .join(&scope)
+                .join(format!("{pkg_name}.toml"))
+                .exists();
+
+            let mcp_count = manifest.mcps.len() as u32;
+            results.push(HubPackageEntry {
+                name: full_name,
+                description: manifest.package.description,
+                skill_count: 0,
+                mcp_count,
+                installed,
+                repository: manifest.package.repository,
+            });
+        }
+    }
+
+    results.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(results)
 }
 
 /// Parse a `scope/name` package string into `(scope, name)`.
