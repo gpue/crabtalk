@@ -67,6 +67,10 @@ message ClientMessage {
     UnsubscribeEventMsg unsubscribe_event = 41;
     ListSubscriptionsMsg list_subscriptions = 42;
     PublishEventMsg publish_event = 43;
+    // Steering
+    SteerSessionMsg steer_session = 44;
+    // Extension point for downstream products.
+    bytes extension = 100;
   }
 }
 
@@ -76,6 +80,7 @@ message SendMsg {
   optional string sender = 4;
   optional string cwd = 5;
   optional string guest = 6;
+  optional string tool_choice = 7;
 }
 
 message StreamMsg {
@@ -84,6 +89,7 @@ message StreamMsg {
   optional string sender = 4;
   optional string cwd = 5;
   optional string guest = 6;
+  optional string tool_choice = 7;
 }
 
 message Ping {}
@@ -330,6 +336,8 @@ message ServerMessage {
     // Event bus
     SubscriptionInfo subscription_info = 25;
     SubscriptionList subscription_list = 26;
+    // Extension point for downstream products.
+    bytes extension = 100;
   }
 }
 
@@ -378,6 +386,7 @@ message StreamEvent {
     ToolsCompleteEvent tools_complete = 6;
     StreamEnd end = 7;
     AskUserEvent ask_user = 8;
+    UserSteeredEvent user_steered = 9;
   }
 }
 
@@ -433,6 +442,16 @@ message ReplyToAsk {
   string agent = 1;
   string sender = 2;
   string content = 3;
+}
+
+message SteerSessionMsg {
+  string agent = 1;
+  string sender = 2;
+  string content = 3;
+}
+
+message UserSteeredEvent {
+  string content = 1;
 }
 
 message ErrorMsg {

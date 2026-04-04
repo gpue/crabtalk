@@ -17,10 +17,10 @@ use wcore::protocol::{
         CronInfo, CronList, DaemonStats, InstallPluginMsg, McpInfo, McpStatus, ModelInfo,
         PluginDone, PluginEvent, PluginInfo, PluginSetupOutput, PluginStep, PluginWarning,
         ProtoProviderKind, ProviderInfo, ProviderPresetInfo, PublishEventMsg, ResourceKind,
-        SendMsg, SendResponse, SkillInfo, SourceKind, StreamChunk, StreamEnd, StreamEvent,
-        StreamMsg, StreamStart, StreamThinking, SubscribeEventMsg, SubscriptionInfo,
+        SendMsg, SendResponse, SkillInfo, SourceKind, SteerSessionMsg, StreamChunk, StreamEnd,
+        StreamEvent, StreamMsg, StreamStart, StreamThinking, SubscribeEventMsg, SubscriptionInfo,
         SubscriptionList, TokenUsage, ToolCallInfo, ToolResultEvent, ToolStartEvent,
-        ToolsCompleteEvent, UpdateAgentMsg, plugin_event, stream_event,
+        ToolsCompleteEvent, UpdateAgentMsg, UserSteeredEvent, plugin_event, stream_event,
     },
 };
 use wcore::{AgentEvent, AgentStep};
@@ -40,7 +40,12 @@ impl<H: Host + 'static> Server for Daemon<H> {
                 .set_conversation_cwd(conversation_id, cwd.clone())
                 .await;
         }
-        let response = rt.send_to(conversation_id, &req.content, sender).await?;
+        let tool_choice = req
+            .tool_choice
+            .map(|s| wcore::model::ToolChoice::from(s.as_str()));
+        let response = rt
+            .send_to(conversation_id, &req.content, sender, tool_choice)
+            .await?;
         let provider = rt
             .model
             .provider_name_for(&response.model)
@@ -64,6 +69,9 @@ impl<H: Host + 'static> Server for Daemon<H> {
         let sender = req.sender.unwrap_or_default();
         let cwd = req.cwd.map(std::path::PathBuf::from);
         let guest = req.guest.unwrap_or_default();
+        let tool_choice = req
+            .tool_choice
+            .map(|s| wcore::model::ToolChoice::from(s.as_str()));
         async_stream::try_stream! {
             let rt: Arc<_> = runtime.read().await.clone();
             let created_by = if sender.is_empty() { "user".into() } else { sender.clone() };
@@ -76,7 +84,7 @@ impl<H: Host + 'static> Server for Daemon<H> {
             yield StreamEvent { event: Some(stream_event::Event::Start(StreamStart { agent: responding_agent.clone() })) };
 
             let stream: std::pin::Pin<Box<dyn futures_core::Stream<Item = wcore::AgentEvent> + Send + '_>> = if guest.is_empty() {
-                Box::pin(rt.stream_to(conversation_id, &content, &sender))
+                Box::pin(rt.stream_to(conversation_id, &content, &sender, tool_choice))
             } else {
                 Box::pin(rt.guest_stream_to(conversation_id, &content, &sender, &guest))
             };
@@ -135,7 +143,9 @@ impl<H: Host + 'static> Server for Daemon<H> {
                     AgentEvent::ToolCallsComplete => {
                         yield StreamEvent { event: Some(stream_event::Event::ToolsComplete(ToolsCompleteEvent {})) };
                     }
-                    AgentEvent::Compact { .. } => {
+                    AgentEvent::Compact { .. } => {}
+                    AgentEvent::UserSteered { ref content } => {
+                        yield StreamEvent { event: Some(stream_event::Event::UserSteered(UserSteeredEvent { content: content.clone() })) };
                     }
                     AgentEvent::Done(resp) => {
                         let error = if let wcore::AgentStopReason::Error(ref e) = resp.stop_reason {
@@ -329,6 +339,25 @@ impl<H: Host + 'static> Server for Daemon<H> {
             return Ok(());
         }
         anyhow::bail!("no pending ask_user for agent='{agent}' sender='{sender}'")
+    }
+
+    async fn steer_session(&self, req: SteerSessionMsg) -> Result<()> {
+        let rt = self.runtime.read().await.clone();
+        let sender = if req.sender.is_empty() {
+            "user"
+        } else {
+            &req.sender
+        };
+        let conversation_id = rt
+            .find_conversation_id(&req.agent, sender)
+            .await
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "conversation not found for agent='{}' sender='{sender}'",
+                    req.agent
+                )
+            })?;
+        rt.steer(conversation_id, req.content).await
     }
 
     async fn list_agents(&self) -> Result<Vec<AgentInfo>> {
