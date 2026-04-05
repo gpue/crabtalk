@@ -35,10 +35,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-8f92d67c.js";
+            window.path_to_searchindex_js = "../searchindex-1688d608.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-18b7bade.js"></script>
+        <script src="../toc-0568fcff.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -216,7 +216,8 @@ This is an inclusive whitelist, not a denylist.</p>
 <p>When an agent has any scoping (non-empty skills, mcps, or members), the runtime
 computes a tool whitelist during <code>on_build_agent</code>:</p>
 <ol>
-<li>Start with <code>BASE_TOOLS</code>: <code>bash</code>, <code>ask_user</code> — always available.</li>
+<li>Start with <code>BASE_TOOLS</code>: <code>bash</code>, <code>ask_user</code>, <code>read</code>, <code>edit</code> — always
+available.</li>
 <li>If memory is enabled: add <code>recall</code>, <code>remember</code>, <code>memory</code>, <code>forget</code>.</li>
 <li>If skills list is non-empty: add <code>skill</code> tool.</li>
 <li>If mcps list is non-empty: add <code>mcp</code> tool.</li>
@@ -247,6 +248,20 @@ list.</li>
 <p>Enforcement happens at runtime, not just at prompt time. Even if the LLM
 ignores the <code>&lt;scope&gt;</code> block and tries to call a restricted tool, the dispatch
 layer rejects it.</p>
+<h3 id="sender-restrictions"><a class="header" href="#sender-restrictions">Sender restrictions</a></h3>
+<p>Not all base tools are available to all senders. <code>bash</code> is blocked for
+non-CLI senders (gateway agents from Telegram, WeChat, etc.) because it
+grants arbitrary shell access. <code>read</code> and <code>edit</code> have no sender
+restriction — they are read-only or scoped mutations that are safe for
+gateway agents. See <a href="https://github.com/crabtalk/crabtalk/issues/67">#67</a>.</p>
+<h3 id="delegate-cwd-isolation"><a class="header" href="#delegate-cwd-isolation">Delegate CWD isolation</a></h3>
+<p>When delegating parallel tasks, the orchestrating agent can assign each
+sub-agent a separate working directory via the <code>cwd</code> field on <code>DelegateTask</code>.
+Tools resolve relative paths against the conversation CWD, so isolated CWDs
+prevent concurrent sub-agents from trampling each other’s files. The <code>edit</code>
+tool’s unique-match requirement provides a second layer: if another agent
+changed the file between read and edit, <code>old_string</code> won’t match and the
+edit fails — optimistic concurrency without locks.</p>
 <h3 id="default-agent"><a class="header" href="#default-agent">Default agent</a></h3>
 <p>The default agent (primary) has no scope restrictions — empty lists on all
 four dimensions. Scoping is for sub-agents that need constrained access.</p>
@@ -273,7 +288,7 @@ to. Enforcement must be at the dispatch layer.</p>
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
-                            <a rel="next prefetch" href="../rfcs/0135-agent-first.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                            <a rel="next prefetch" href="../rfcs/0121-event-bus.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                             </a>
 
@@ -287,7 +302,7 @@ to. Enforcement must be at the dispatch layer.</p>
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 
-                    <a rel="next prefetch" href="../rfcs/0135-agent-first.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                    <a rel="next prefetch" href="../rfcs/0121-event-bus.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                     </a>
             </nav>

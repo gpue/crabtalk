@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-8f92d67c.js";
+            window.path_to_searchindex_js = "searchindex-1688d608.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-18b7bade.js"></script>
+        <script src="toc-0568fcff.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -1167,7 +1167,8 @@ This is an inclusive whitelist, not a denylist.</p>
 <p>When an agent has any scoping (non-empty skills, mcps, or members), the runtime
 computes a tool whitelist during <code>on_build_agent</code>:</p>
 <ol>
-<li>Start with <code>BASE_TOOLS</code>: <code>bash</code>, <code>ask_user</code> — always available.</li>
+<li>Start with <code>BASE_TOOLS</code>: <code>bash</code>, <code>ask_user</code>, <code>read</code>, <code>edit</code> — always
+available.</li>
 <li>If memory is enabled: add <code>recall</code>, <code>remember</code>, <code>memory</code>, <code>forget</code>.</li>
 <li>If skills list is non-empty: add <code>skill</code> tool.</li>
 <li>If mcps list is non-empty: add <code>mcp</code> tool.</li>
@@ -1198,6 +1199,20 @@ list.</li>
 <p>Enforcement happens at runtime, not just at prompt time. Even if the LLM
 ignores the <code>&lt;scope&gt;</code> block and tries to call a restricted tool, the dispatch
 layer rejects it.</p>
+<h3 id="sender-restrictions"><a class="header" href="#sender-restrictions">Sender restrictions</a></h3>
+<p>Not all base tools are available to all senders. <code>bash</code> is blocked for
+non-CLI senders (gateway agents from Telegram, WeChat, etc.) because it
+grants arbitrary shell access. <code>read</code> and <code>edit</code> have no sender
+restriction — they are read-only or scoped mutations that are safe for
+gateway agents. See <a href="https://github.com/crabtalk/crabtalk/issues/67">#67</a>.</p>
+<h3 id="delegate-cwd-isolation"><a class="header" href="#delegate-cwd-isolation">Delegate CWD isolation</a></h3>
+<p>When delegating parallel tasks, the orchestrating agent can assign each
+sub-agent a separate working directory via the <code>cwd</code> field on <code>DelegateTask</code>.
+Tools resolve relative paths against the conversation CWD, so isolated CWDs
+prevent concurrent sub-agents from trampling each other’s files. The <code>edit</code>
+tool’s unique-match requirement provides a second layer: if another agent
+changed the file between read and edit, <code>old_string</code> won’t match and the
+edit fails — optimistic concurrency without locks.</p>
 <h3 id="default-agent"><a class="header" href="#default-agent">Default agent</a></h3>
 <p>The default agent (primary) has no scope restrictions — empty lists on all
 four dimensions. Scoping is for sub-agents that need constrained access.</p>
@@ -1216,6 +1231,154 @@ to. Enforcement must be at the dispatch layer.</p>
 <li>Should scope violations be logged as security events for monitoring?</li>
 </ul>
 <div style="break-before: page; page-break-before: always;"></div>
+<h1 id="0121---event-bus"><a class="header" href="#0121---event-bus">0121 - Event Bus</a></h1>
+<ul>
+<li>Feature Name: Unified Event Bus</li>
+<li>Start Date: 2026-04-04</li>
+<li>Discussion: <a href="https://github.com/crabtalk/crabtalk/issues/121">#121</a></li>
+<li>Crates: daemon, core, runtime</li>
+<li>Updates: <a href="#0080---cron">0080 (Cron)</a></li>
+</ul>
+<h2 id="summary-10"><a class="header" href="#summary-10">Summary</a></h2>
+<p>A daemon-level event bus that routes named events to target agents via
+exact-match subscriptions. Agent completion is the first built-in event source.
+The bus also enables non-blocking delegation and ad-hoc worker agents.</p>
+<h2 id="motivation-10"><a class="header" href="#motivation-10">Motivation</a></h2>
+<p>The daemon can trigger agents on a schedule (cron) and run agents on user
+request (protocol). But there’s no way for one agent’s completion to trigger
+another agent. The Signal pipeline (crabtalk/app#59) needs exactly this:</p>
+<pre><code>RSS fetch → Scout classifies → Crab enriches → client notification
+</code></pre>
+<p>Each stage produces a result that the next stage consumes. Without an event
+system, this requires the client to orchestrate the chain — polling, waiting,
+re-sending. The daemon should own this.</p>
+<p>Separately, <code>delegate</code> blocks the parent agent until all tasks complete. For
+background research or parallel work, this is a limitation. If the daemon can
+route agent completion events, non-blocking delegation falls out for free.</p>
+<h2 id="design-10"><a class="header" href="#design-10">Design</a></h2>
+<h3 id="event-bus"><a class="header" href="#event-bus">Event bus</a></h3>
+<p>An in-memory subscription table that matches events by exact source string and
+fires target agents with the event payload as message content.</p>
+<pre><code class="language-toml"># events.toml
+[[subscription]]
+id = 1
+source = "agent:scout:done"
+target_agent = "crab"
+once = false
+</code></pre>
+<p>Follows the CronStore pattern: HashMap-backed, TOML-persisted, auto-incrementing
+IDs, atomic writes (tmp + rename). Survives runtime reloads.</p>
+<h3 id="event-sources"><a class="header" href="#event-sources">Event sources</a></h3>
+<p>Events are namespaced strings. Two source types exist today:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Source</th><th>Example</th><th>Emitter</th></tr>
+</thead>
+<tbody>
+<tr><td>Agent completion</td><td><code>agent:scout:done</code></td><td>Daemon, via <code>on_agent_event</code> hook</td></tr>
+<tr><td>External</td><td><code>rss:fetch</code>, <code>signal:classified</code></td><td>Client or adapter, via <code>PublishEvent</code></td></tr>
+</tbody>
+</table>
+</div>
+<p>Agent completion events are emitted automatically when a conversation stream
+ends. The payload is the agent’s final text response.</p>
+<p>External events are published via the <code>PublishEvent</code> protocol message — any
+client, adapter, or webhook handler can fire events into the bus.</p>
+<h3 id="routing"><a class="header" href="#routing">Routing</a></h3>
+<pre><code>Event arrives (via DaemonEvent::PublishEvent)
+  → event loop calls EventBus::publish() inline (no spawn)
+  → exact match source against subscription table
+  → for each match: fire target agent via SendMsg (fire-and-forget)
+  → if once: remove subscription, persist
+</code></pre>
+<p>Events always start new work. There is no injection into active conversations —
+that’s a separate concern (#117).</p>
+<p>Fired agents receive the payload as message content with sender
+<code>"event:{source}"</code>. This follows the established convention
+(<code>"delegate:{id}"</code>, <code>"cron"</code>) for non-user senders.</p>
+<h3 id="protocol-1"><a class="header" href="#protocol-1">Protocol</a></h3>
+<p>Four new operations on the <code>Server</code> trait:</p>
+<pre><code class="language-protobuf">message SubscribeEventMsg {
+  string source = 1;
+  string target_agent = 2;
+  bool once = 3;
+}
+
+message UnsubscribeEventMsg { uint64 id = 1; }
+message ListSubscriptionsMsg {}
+message PublishEventMsg { string source = 1; string payload = 2; }
+</code></pre>
+<p>Responses: <code>SubscriptionInfo</code> for subscribe, <code>Pong</code> for unsubscribe/publish,
+<code>SubscriptionList</code> for list.</p>
+<h3 id="daemoneventpublishevent"><a class="header" href="#daemoneventpublishevent">DaemonEvent::PublishEvent</a></h3>
+<p>All publish paths route through a single <code>DaemonEvent::PublishEvent</code> variant
+in the central event loop. This avoids lock-ordering issues — the event bus
+mutex is only acquired inside the sequential event loop, never from the
+protocol handler or hook callbacks directly.</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>DaemonEvent::PublishEvent { source, payload } =&gt; {
+    self.events.lock().await.publish(&amp;source, &amp;payload);
+}
+<span class="boring">}</span></code></pre>
+<h3 id="non-blocking-delegation"><a class="header" href="#non-blocking-delegation">Non-blocking delegation</a></h3>
+<p>The <code>delegate</code> tool gains a <code>background: bool</code> field. When true:</p>
+<ol>
+<li>Tasks are spawned via the existing <code>spawn_agent_task</code> mechanism</li>
+<li><code>dispatch_delegate</code> returns immediately with task IDs</li>
+<li>The parent agent continues working</li>
+<li>When each task completes, the daemon emits <code>agent:{name}:done</code></li>
+<li>Event bus routes the completion to any matching subscriptions</li>
+</ol>
+<p>No new mechanism — just the existing spawn infrastructure plus the event bus.</p>
+<h3 id="worker-pseudo-agent"><a class="header" href="#worker-pseudo-agent">Worker pseudo-agent</a></h3>
+<p>A built-in <code>worker</code> agent registered at daemon startup alongside <code>crab</code>.
+Always available as a delegate target without pre-configuration:</p>
+<ul>
+<li>Inherits the system agent’s thinking setting</li>
+<li>Gets the full tool registry (no explicit filter)</li>
+<li>Ephemeral — sessions are killed after task completion (existing behavior)</li>
+<li>No <code>members</code> list gate — <code>worker</code> is always a valid delegate target</li>
+</ul>
+<p>This eliminates the friction of configuring named agents for ad-hoc tasks like
+“read these files and summarize” or “search for X in the codebase.”</p>
+<h2 id="what-this-is-not"><a class="header" href="#what-this-is-not">What this is NOT</a></h2>
+<ul>
+<li><strong>Not a message broker.</strong> No durability, no exactly-once delivery, no dead
+letter queues. Fire-and-forget with best-effort delivery.</li>
+<li><strong>Not an orchestration DAG.</strong> No conditional routing, no fan-out/fan-in.
+Agents subscribe to events — that’s it.</li>
+<li><strong>Not a replacement for <code>delegate</code>.</strong> Delegation is synchronous and returns
+results inline. Events are asynchronous and deliver results out-of-band.
+<code>background: true</code> bridges the two.</li>
+</ul>
+<h2 id="updates"><a class="header" href="#updates">Updates</a></h2>
+<h3 id="0080---cron-1"><a class="header" href="#0080---cron-1">0080 - Cron</a></h3>
+<p>The cron system continues to work as-is. Cron entries fire skills via the
+daemon event channel — this is unchanged. A future iteration may refactor cron
+as an event source adapter, emitting <code>cron:{id}:fired</code> events into the bus, but
+this is not in scope. The event bus is additive, not a cron replacement.</p>
+<h2 id="alternatives-10"><a class="header" href="#alternatives-10">Alternatives</a></h2>
+<p><strong>Agent completion triggers (no bus).</strong> A simpler design where completion of
+agent X directly triggers agent Y, without a general subscription mechanism.
+Rejected because the Signal pipeline needs external events (RSS fetch results)
+alongside agent completions — a bus handles both uniformly.</p>
+<p><strong>Glob matching on source patterns.</strong> The RFC originally proposed wildcard
+subscriptions like <code>"agent:*:done"</code>. Rejected for v1 — exact match covers all
+current use cases. Glob matching can be added when a real consumer needs it.</p>
+<p><strong>Template interpolation.</strong> The RFC originally proposed <code>{{payload}}</code>
+interpolation in a <code>prompt_template</code> field. Rejected — agents are the template
+engine. The payload goes in as-is; the agent’s instructions handle
+interpretation.</p>
+<h2 id="unresolved-questions-10"><a class="header" href="#unresolved-questions-10">Unresolved Questions</a></h2>
+<ul>
+<li>Should there be a max subscription count?</li>
+<li>Should the bus detect infinite loops (agent A triggers B triggers A)?
+Currently fire-and-forget prevents stack overflow but allows unbounded
+chains of spawned tasks.</li>
+</ul>
+<div style="break-before: page; page-break-before: always;"></div>
 <h1 id="0135---agent-first-protocol"><a class="header" href="#0135---agent-first-protocol">0135 - Agent-First Protocol</a></h1>
 <ul>
 <li>Feature Name: Agent-First Protocol</li>
@@ -1225,11 +1388,11 @@ to. Enforcement must be at the dispatch layer.</p>
 <li>Supersedes: <a href="rfcs/0064-session.html">0064 (Session)</a>, <a href="rfcs/0078-compact-session.html">0078 (Compact Session)</a></li>
 <li>Updates: <a href="#0018---protocol">0018 (Protocol)</a>, <a href="#0038---memory">0038 (Memory)</a></li>
 </ul>
-<h2 id="summary-10"><a class="header" href="#summary-10">Summary</a></h2>
+<h2 id="summary-11"><a class="header" href="#summary-11">Summary</a></h2>
 <p>Replace session-centric protocol addressing with agent-centric addressing.
 Users talk to agents, not sessions. Introduce guest turns for multi-agent
 conversations and compaction archives as the agent’s long-term memory.</p>
-<h2 id="motivation-10"><a class="header" href="#motivation-10">Motivation</a></h2>
+<h2 id="motivation-11"><a class="header" href="#motivation-11">Motivation</a></h2>
 <p>The original protocol was session-centric: clients managed session IDs to kill,
 reply, compact, and route messages. This leaked an implementation detail (the
 session ID) into every client and forced multi-agent interaction into either
@@ -1252,7 +1415,7 @@ transport state) with agent memory (message history, compaction). These are
 different lifecycles — connections are ephemeral, conversations persist.</p>
 </li>
 </ol>
-<h2 id="design-10"><a class="header" href="#design-10">Design</a></h2>
+<h2 id="design-11"><a class="header" href="#design-11">Design</a></h2>
 <h3 id="core-model"><a class="header" href="#core-model">Core model</a></h3>
 <p>Each agent has <strong>one continuous conversation</strong> per user. Conversations are
 keyed by <code>(agent, sender)</code> — no session IDs in the protocol.</p>
@@ -1380,7 +1543,7 @@ to <code>Conversation</code>. Session IDs are removed from the protocol.</p>
 <p>The compact-then-handoff pattern for @mentions is replaced by guest turns.
 The daemon handles multi-agent conversation natively — no client-side compact
 logic needed.</p>
-<h2 id="updates"><a class="header" href="#updates">Updates</a></h2>
+<h2 id="updates-1"><a class="header" href="#updates-1">Updates</a></h2>
 <h3 id="0018---protocol-1"><a class="header" href="#0018---protocol-1">0018 - Protocol</a></h3>
 <p>Session-addressed messages are replaced with (agent, sender) addressing.
 <code>StreamMsg</code> and <code>SendMsg</code> gain a <code>guest</code> field. <code>SessionInfo</code> becomes
