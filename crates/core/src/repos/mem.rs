@@ -1,77 +1,51 @@
-//! In-memory repository implementations for tests.
-//!
-//! Each repo is backed by `Mutex<HashMap<..>>` or `Mutex<Vec<..>>`.
-//! `InMemoryRepos` bundles all four into a single [`Repos`]
-//! implementation.
+//! In-memory [`Storage`] implementation for tests.
 
 use crate::{
-    AgentConfig, AgentId,
+    AgentConfig, AgentId, ManifestConfig, NodeConfig,
     model::HistoryEntry,
-    repos::{
-        AgentRepo, MemoryEntry, MemoryRepo, Repos, SessionHandle, SessionRepo, SessionSnapshot,
-        SessionSummary, Skill, SkillRepo,
-    },
+    repos::{MemoryEntry, SessionHandle, SessionSnapshot, SessionSummary, Skill, Storage},
     runtime::conversation::{ArchiveSegment, ConversationMeta, EventLine},
 };
 use anyhow::Result;
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex},
-};
+use std::{collections::HashMap, sync::Mutex};
 
-// ── InMemoryMemoryRepo ──────────────────────────────────────────────
-
-#[derive(Default)]
-pub struct InMemoryMemoryRepo {
-    entries: Mutex<HashMap<String, MemoryEntry>>,
-    index: Mutex<Option<String>>,
+/// Per-session state in the in-memory backend.
+#[derive(Clone)]
+struct SessionState {
+    meta: ConversationMeta,
+    messages: Vec<HistoryEntry>,
+    events: Vec<EventLine>,
+    compacts: Vec<(String, String)>,
 }
 
-impl InMemoryMemoryRepo {
-    pub fn new() -> Self {
-        Self::default()
-    }
-}
-
-impl MemoryRepo for InMemoryMemoryRepo {
-    fn list(&self) -> Result<Vec<MemoryEntry>> {
-        Ok(self.entries.lock().unwrap().values().cloned().collect())
-    }
-
-    fn load(&self, name: &str) -> Result<Option<MemoryEntry>> {
-        Ok(self.entries.lock().unwrap().get(name).cloned())
-    }
-
-    fn save(&self, entry: &MemoryEntry) -> Result<()> {
-        self.entries
-            .lock()
-            .unwrap()
-            .insert(entry.name.clone(), entry.clone());
-        Ok(())
-    }
-
-    fn delete(&self, name: &str) -> Result<bool> {
-        Ok(self.entries.lock().unwrap().remove(name).is_some())
-    }
-
-    fn load_index(&self) -> Result<Option<String>> {
-        Ok(self.index.lock().unwrap().clone())
-    }
-
-    fn save_index(&self, content: &str) -> Result<()> {
-        *self.index.lock().unwrap() = Some(content.to_owned());
-        Ok(())
-    }
-}
-
-// ── InMemorySkillRepo ───────────────────────────────────────────────
-
-#[derive(Default)]
-pub struct InMemorySkillRepo {
+/// In-memory [`Storage`] for tests.
+pub struct InMemoryStorage {
+    memories: Mutex<HashMap<String, MemoryEntry>>,
+    memory_index: Mutex<Option<String>>,
     skills: Mutex<Vec<Skill>>,
+    sessions: Mutex<HashMap<String, SessionState>>,
+    next_session_seq: Mutex<u32>,
+    agents: Mutex<HashMap<String, (AgentConfig, String)>>,
+    manifest: Mutex<ManifestConfig>,
+    config: Mutex<NodeConfig>,
 }
 
-impl InMemorySkillRepo {
+impl Default for InMemoryStorage {
+    fn default() -> Self {
+        Self {
+            memories: Mutex::new(HashMap::new()),
+            memory_index: Mutex::new(None),
+            skills: Mutex::new(Vec::new()),
+            sessions: Mutex::new(HashMap::new()),
+            next_session_seq: Mutex::new(0),
+            agents: Mutex::new(HashMap::new()),
+            manifest: Mutex::new(ManifestConfig::default()),
+            config: Mutex::new(NodeConfig::default()),
+        }
+    }
+}
+
+impl InMemoryStorage {
     pub fn new() -> Self {
         Self::default()
     }
@@ -79,16 +53,50 @@ impl InMemorySkillRepo {
     pub fn with_skills(skills: Vec<Skill>) -> Self {
         Self {
             skills: Mutex::new(skills),
+            ..Self::default()
         }
     }
 }
 
-impl SkillRepo for InMemorySkillRepo {
-    fn list(&self) -> Result<Vec<Skill>> {
+impl Storage for InMemoryStorage {
+    // ── Memory ─────────────────────────────────────────────────────
+
+    fn list_memories(&self) -> Result<Vec<MemoryEntry>> {
+        Ok(self.memories.lock().unwrap().values().cloned().collect())
+    }
+
+    fn load_memory(&self, name: &str) -> Result<Option<MemoryEntry>> {
+        Ok(self.memories.lock().unwrap().get(name).cloned())
+    }
+
+    fn save_memory(&self, entry: &MemoryEntry) -> Result<()> {
+        self.memories
+            .lock()
+            .unwrap()
+            .insert(entry.name.clone(), entry.clone());
+        Ok(())
+    }
+
+    fn delete_memory(&self, name: &str) -> Result<bool> {
+        Ok(self.memories.lock().unwrap().remove(name).is_some())
+    }
+
+    fn load_memory_index(&self) -> Result<Option<String>> {
+        Ok(self.memory_index.lock().unwrap().clone())
+    }
+
+    fn save_memory_index(&self, content: &str) -> Result<()> {
+        *self.memory_index.lock().unwrap() = Some(content.to_owned());
+        Ok(())
+    }
+
+    // ── Skills ─────────────────────────────────────────────────────
+
+    fn list_skills(&self) -> Result<Vec<Skill>> {
         Ok(self.skills.lock().unwrap().clone())
     }
 
-    fn load(&self, name: &str) -> Result<Option<Skill>> {
+    fn load_skill(&self, name: &str) -> Result<Option<Skill>> {
         Ok(self
             .skills
             .lock()
@@ -97,34 +105,11 @@ impl SkillRepo for InMemorySkillRepo {
             .find(|s| s.name == name)
             .cloned())
     }
-}
 
-// ── InMemorySessionRepo ─────────────────────────────────────────────
+    // ── Sessions ───────────────────────────────────────────────────
 
-/// Per-session state in the in-memory backend.
-#[derive(Clone)]
-struct SessionState {
-    meta: ConversationMeta,
-    messages: Vec<HistoryEntry>,
-    events: Vec<EventLine>,
-    compacts: Vec<(String, String)>, // (summary, archived_at)
-}
-
-#[derive(Default)]
-pub struct InMemorySessionRepo {
-    sessions: Mutex<HashMap<String, SessionState>>,
-    next_seq: Mutex<u32>,
-}
-
-impl InMemorySessionRepo {
-    pub fn new() -> Self {
-        Self::default()
-    }
-}
-
-impl SessionRepo for InMemorySessionRepo {
-    fn create(&self, agent: &str, created_by: &str) -> Result<SessionHandle> {
-        let mut seq = self.next_seq.lock().unwrap();
+    fn create_session(&self, agent: &str, created_by: &str) -> Result<SessionHandle> {
+        let mut seq = self.next_session_seq.lock().unwrap();
         *seq += 1;
         let slug = format!("{}_{}", agent, seq);
         let state = SessionState {
@@ -143,10 +128,8 @@ impl SessionRepo for InMemorySessionRepo {
         Ok(SessionHandle::new(slug))
     }
 
-    fn find_latest(&self, agent: &str, created_by: &str) -> Result<Option<SessionHandle>> {
+    fn find_latest_session(&self, agent: &str, created_by: &str) -> Result<Option<SessionHandle>> {
         let sessions = self.sessions.lock().unwrap();
-        // Return the last matching session by insertion order (HashMap
-        // doesn't guarantee this, but for tests it's fine).
         for (slug, state) in sessions.iter() {
             if state.meta.agent == agent && state.meta.created_by == created_by {
                 return Ok(Some(SessionHandle::new(slug.clone())));
@@ -155,12 +138,11 @@ impl SessionRepo for InMemorySessionRepo {
         Ok(None)
     }
 
-    fn load(&self, handle: &SessionHandle) -> Result<Option<SessionSnapshot>> {
+    fn load_session(&self, handle: &SessionHandle) -> Result<Option<SessionSnapshot>> {
         let sessions = self.sessions.lock().unwrap();
         let Some(state) = sessions.get(handle.as_str()) else {
             return Ok(None);
         };
-        // Replay from last compact forward.
         let history = if let Some((summary, _)) = state.compacts.last() {
             let mut h = vec![HistoryEntry::user(summary)];
             h.extend(state.messages.clone());
@@ -174,7 +156,7 @@ impl SessionRepo for InMemorySessionRepo {
         }))
     }
 
-    fn load_archives(&self, handle: &SessionHandle) -> Result<Vec<ArchiveSegment>> {
+    fn load_session_archives(&self, handle: &SessionHandle) -> Result<Vec<ArchiveSegment>> {
         let sessions = self.sessions.lock().unwrap();
         let Some(state) = sessions.get(handle.as_str()) else {
             return Ok(Vec::new());
@@ -201,7 +183,11 @@ impl SessionRepo for InMemorySessionRepo {
             .collect())
     }
 
-    fn append_messages(&self, handle: &SessionHandle, entries: &[HistoryEntry]) -> Result<()> {
+    fn append_session_messages(
+        &self,
+        handle: &SessionHandle,
+        entries: &[HistoryEntry],
+    ) -> Result<()> {
         let mut sessions = self.sessions.lock().unwrap();
         if let Some(state) = sessions.get_mut(handle.as_str()) {
             state.messages.extend(entries.iter().cloned());
@@ -209,7 +195,7 @@ impl SessionRepo for InMemorySessionRepo {
         Ok(())
     }
 
-    fn append_events(&self, handle: &SessionHandle, events: &[EventLine]) -> Result<()> {
+    fn append_session_events(&self, handle: &SessionHandle, events: &[EventLine]) -> Result<()> {
         let mut sessions = self.sessions.lock().unwrap();
         if let Some(state) = sessions.get_mut(handle.as_str()) {
             state.events.extend(events.iter().cloned());
@@ -217,19 +203,18 @@ impl SessionRepo for InMemorySessionRepo {
         Ok(())
     }
 
-    fn append_compact(&self, handle: &SessionHandle, summary: &str) -> Result<()> {
+    fn append_session_compact(&self, handle: &SessionHandle, summary: &str) -> Result<()> {
         let mut sessions = self.sessions.lock().unwrap();
         if let Some(state) = sessions.get_mut(handle.as_str()) {
             state
                 .compacts
                 .push((summary.to_owned(), chrono::Utc::now().to_rfc3339()));
-            // Clear messages — the compact summary becomes the new base.
             state.messages.clear();
         }
         Ok(())
     }
 
-    fn update_meta(&self, handle: &SessionHandle, meta: &ConversationMeta) -> Result<()> {
+    fn update_session_meta(&self, handle: &SessionHandle, meta: &ConversationMeta) -> Result<()> {
         let mut sessions = self.sessions.lock().unwrap();
         if let Some(state) = sessions.get_mut(handle.as_str()) {
             state.meta = meta.clone();
@@ -237,7 +222,7 @@ impl SessionRepo for InMemorySessionRepo {
         Ok(())
     }
 
-    fn delete(&self, handle: &SessionHandle) -> Result<bool> {
+    fn delete_session(&self, handle: &SessionHandle) -> Result<bool> {
         Ok(self
             .sessions
             .lock()
@@ -245,23 +230,10 @@ impl SessionRepo for InMemorySessionRepo {
             .remove(handle.as_str())
             .is_some())
     }
-}
 
-// ── InMemoryAgentRepo ───────────────────────────────────────────────
+    // ── Agents ─────────────────────────────────────────────────────
 
-#[derive(Default)]
-pub struct InMemoryAgentRepo {
-    agents: Mutex<HashMap<String, (AgentConfig, String)>>, // name -> (config, prompt)
-}
-
-impl InMemoryAgentRepo {
-    pub fn new() -> Self {
-        Self::default()
-    }
-}
-
-impl AgentRepo for InMemoryAgentRepo {
-    fn list(&self) -> Result<Vec<AgentConfig>> {
+    fn list_agents(&self) -> Result<Vec<AgentConfig>> {
         Ok(self
             .agents
             .lock()
@@ -275,7 +247,7 @@ impl AgentRepo for InMemoryAgentRepo {
             .collect())
     }
 
-    fn load(&self, id: &AgentId) -> Result<Option<AgentConfig>> {
+    fn load_agent(&self, id: &AgentId) -> Result<Option<AgentConfig>> {
         let agents = self.agents.lock().unwrap();
         for (config, prompt) in agents.values() {
             if config.id == *id {
@@ -287,7 +259,7 @@ impl AgentRepo for InMemoryAgentRepo {
         Ok(None)
     }
 
-    fn load_by_name(&self, name: &str) -> Result<Option<AgentConfig>> {
+    fn load_agent_by_name(&self, name: &str) -> Result<Option<AgentConfig>> {
         let agents = self.agents.lock().unwrap();
         if let Some((config, prompt)) = agents.get(name) {
             let mut c = config.clone();
@@ -298,7 +270,7 @@ impl AgentRepo for InMemoryAgentRepo {
         }
     }
 
-    fn upsert(&self, config: &AgentConfig, prompt: &str) -> Result<()> {
+    fn upsert_agent(&self, config: &AgentConfig, prompt: &str) -> Result<()> {
         self.agents
             .lock()
             .unwrap()
@@ -306,7 +278,7 @@ impl AgentRepo for InMemoryAgentRepo {
         Ok(())
     }
 
-    fn delete(&self, id: &AgentId) -> Result<bool> {
+    fn delete_agent(&self, id: &AgentId) -> Result<bool> {
         let mut agents = self.agents.lock().unwrap();
         let name = agents
             .iter()
@@ -320,7 +292,7 @@ impl AgentRepo for InMemoryAgentRepo {
         }
     }
 
-    fn rename(&self, id: &AgentId, new_name: &str) -> Result<bool> {
+    fn rename_agent(&self, id: &AgentId, new_name: &str) -> Result<bool> {
         let mut agents = self.agents.lock().unwrap();
         let old_name = agents
             .iter()
@@ -335,54 +307,28 @@ impl AgentRepo for InMemoryAgentRepo {
         }
         Ok(false)
     }
-}
 
-// ── InMemoryRepos ───────────────────────────────────────────────────
+    // ── Manifest ───────────────────────────────────────────────────
 
-/// Composite in-memory backend implementing [`Repos`].
-pub struct InMemoryRepos {
-    pub memory: Arc<InMemoryMemoryRepo>,
-    pub skills: Arc<InMemorySkillRepo>,
-    pub sessions: Arc<InMemorySessionRepo>,
-    pub agents: Arc<InMemoryAgentRepo>,
-}
-
-impl Default for InMemoryRepos {
-    fn default() -> Self {
-        Self {
-            memory: Arc::new(InMemoryMemoryRepo::new()),
-            skills: Arc::new(InMemorySkillRepo::new()),
-            sessions: Arc::new(InMemorySessionRepo::new()),
-            agents: Arc::new(InMemoryAgentRepo::new()),
-        }
-    }
-}
-
-impl InMemoryRepos {
-    pub fn new() -> Self {
-        Self::default()
-    }
-}
-
-impl Repos for InMemoryRepos {
-    type Memory = InMemoryMemoryRepo;
-    type Skills = InMemorySkillRepo;
-    type Sessions = InMemorySessionRepo;
-    type Agents = InMemoryAgentRepo;
-
-    fn memory(&self) -> &Arc<InMemoryMemoryRepo> {
-        &self.memory
+    fn load_local_manifest(&self) -> Result<ManifestConfig> {
+        Ok(self.manifest.lock().unwrap().clone())
     }
 
-    fn skills(&self) -> &Arc<InMemorySkillRepo> {
-        &self.skills
+    fn save_local_manifest(&self, manifest: &ManifestConfig) -> Result<()> {
+        *self.manifest.lock().unwrap() = manifest.clone();
+        Ok(())
     }
 
-    fn sessions(&self) -> &Arc<InMemorySessionRepo> {
-        &self.sessions
+    fn load_config(&self) -> Result<NodeConfig> {
+        Ok(self.config.lock().unwrap().clone())
     }
 
-    fn agents(&self) -> &Arc<InMemoryAgentRepo> {
-        &self.agents
+    fn save_config(&self, config: &NodeConfig) -> Result<()> {
+        *self.config.lock().unwrap() = config.clone();
+        Ok(())
+    }
+
+    fn scaffold(&self) -> Result<()> {
+        Ok(())
     }
 }

@@ -1,7 +1,7 @@
-//! Server trait implementation for the Daemon.
+//! Server trait implementation for the Node.
 
 use crate::event_bus::EventSubscription;
-use crate::{cron::CronEntry, daemon::Daemon};
+use crate::{cron::CronEntry, node::Node};
 use anyhow::{Context, Result};
 use crabllm_core::Provider;
 use futures_util::{StreamExt, pin_mut};
@@ -26,12 +26,9 @@ use wcore::protocol::{
         UpdateAgentMsg, UserSteeredEvent, plugin_event, stream_event,
     },
 };
-use wcore::{
-    AgentEvent, AgentStep,
-    repos::{AgentRepo, Repos, SessionRepo},
-};
+use wcore::{AgentEvent, AgentStep, repos::Storage};
 
-impl<P: Provider + 'static, H: Host + 'static> Server for Daemon<P, H> {
+impl<P: Provider + 'static, H: Host + 'static> Server for Node<P, H> {
     async fn send(&self, req: SendMsg) -> Result<SendResponse> {
         let rt: Arc<_> = self.runtime.read().await.clone();
         let sender = req.sender.as_deref().unwrap_or("");
@@ -52,7 +49,7 @@ impl<P: Provider + 'static, H: Host + 'static> Server for Daemon<P, H> {
         let response = rt
             .send_to(conversation_id, &req.content, sender, tool_choice)
             .await?;
-        let provider = self.provider_name_for_model(&response.model);
+        let provider = self.provider_name_for_model(&response.model).await;
         Ok(SendResponse {
             agent: req.agent,
             content: response.final_response.unwrap_or_default(),
@@ -170,7 +167,7 @@ impl<P: Provider + 'static, H: Host + 'static> Server for Daemon<P, H> {
                         } else {
                             String::new()
                         };
-                        let provider = self.provider_name_for_model(&resp.model);
+                        let provider = self.provider_name_for_model(&resp.model).await;
                         yield StreamEvent { event: Some(stream_event::Event::End(StreamEnd {
                             agent: responding_agent.clone(),
                             error,
@@ -263,6 +260,7 @@ impl<P: Provider + 'static, H: Host + 'static> Server for Daemon<P, H> {
         let uptime = self.started_at.elapsed().as_secs();
         let active_model = self
             .load_config()
+            .await
             .ok()
             .and_then(|c| c.system.crab.model)
             .unwrap_or_default();
@@ -338,7 +336,7 @@ impl<P: Provider + 'static, H: Host + 'static> Server for Daemon<P, H> {
     }
 
     async fn publish_event(&self, req: PublishEventMsg) -> Result<()> {
-        let _ = self.event_tx.send(crate::DaemonEvent::PublishEvent {
+        let _ = self.event_tx.send(crate::NodeEvent::PublishEvent {
             source: req.source,
             payload: req.payload,
         });
@@ -408,7 +406,8 @@ impl<P: Provider + 'static, H: Host + 'static> Server for Daemon<P, H> {
         let id = config.id;
         let normalized = serde_json::to_string(&config)
             .context("failed to re-serialize normalized agent config")?;
-        self.write_agent_to_manifest(&req.name, &normalized, true)?;
+        self.write_agent_to_manifest(&req.name, &normalized, true)
+            .await?;
         // Prompt lands at the ULID-keyed Storage path.
         self.write_agent_prompt_to_storage(&id, &req.prompt).await?;
         self.register_agent_from_disk(&req.name).await?;
@@ -421,14 +420,14 @@ impl<P: Provider + 'static, H: Host + 'static> Server for Daemon<P, H> {
             // System crab keeps its baked-in prompt — req.prompt is
             // ignored on this path, matching the fact that load_agents
             // always overrides crab.system_prompt with SYSTEM_AGENT.
-            self.write_system_crab_config(&req.config)?;
+            self.write_system_crab_config(&req.config).await?;
         } else {
             // Preserve the existing ULID across updates so session
             // and cron references stay stable. Mint one only if the
             // manifest has no record of this agent yet.
             let mut config: wcore::AgentConfig =
                 serde_json::from_str(&req.config).context("invalid AgentConfig JSON")?;
-            let existing = self.existing_agent_id(&req.name)?;
+            let existing = self.existing_agent_id(&req.name).await?;
             config.id = existing.unwrap_or_else(|| {
                 if config.id.is_nil() {
                     wcore::AgentId::new()
@@ -439,7 +438,8 @@ impl<P: Provider + 'static, H: Host + 'static> Server for Daemon<P, H> {
             let id = config.id;
             let normalized = serde_json::to_string(&config)
                 .context("failed to re-serialize normalized agent config")?;
-            self.write_agent_to_manifest(&req.name, &normalized, false)?;
+            self.write_agent_to_manifest(&req.name, &normalized, false)
+                .await?;
             if !req.prompt.is_empty() {
                 self.write_agent_prompt_to_storage(&id, &req.prompt).await?;
             }
@@ -449,50 +449,25 @@ impl<P: Provider + 'static, H: Host + 'static> Server for Daemon<P, H> {
     }
 
     async fn delete_agent(&self, name: String) -> Result<bool> {
-        use toml_edit::DocumentMut;
+        let rt = self.runtime.read().await.clone();
+        let storage = rt.storage();
 
-        let manifest_path = self
-            .config_dir
-            .join(wcore::paths::LOCAL_DIR)
-            .join("CrabTalk.toml");
-        if !manifest_path.exists() {
-            return Ok(false);
-        }
-
-        // Capture the ULID before we mutate the manifest so we can
-        // delete the matching Storage-keyed prompt afterwards.
-        let existing_id = self.existing_agent_id(&name)?;
-
-        let content =
-            std::fs::read_to_string(&manifest_path).context("failed to read local manifest")?;
-        let mut doc: DocumentMut = content.parse().context("failed to parse local manifest")?;
-
-        let removed = doc
-            .get_mut("agents")
-            .and_then(|v| v.as_table_like_mut())
-            .and_then(|t| t.remove(&name))
-            .is_some();
+        let mut manifest = storage.load_local_manifest()?;
+        let existing_id = manifest
+            .agents
+            .get(&name)
+            .filter(|c| !c.id.is_nil())
+            .map(|c| c.id);
+        let removed = manifest.agents.remove(&name).is_some();
         if removed {
-            std::fs::write(&manifest_path, doc.to_string())
-                .context("failed to write local manifest")?;
+            storage.save_local_manifest(&manifest)?;
 
-            // Remove the repo-keyed prompt and legacy fs prompt.
-            let rt = self.runtime.read().await.clone();
             if let Some(id) = existing_id
-                && let Err(e) = rt.repos().agents().delete(&id)
+                && let Err(e) = storage.delete_agent(&id)
             {
                 tracing::warn!("failed to delete agent prompt for {id}: {e}");
             }
-            let legacy = self
-                .config_dir
-                .join(wcore::paths::AGENTS_DIR)
-                .join(format!("{name}.md"));
-            if legacy.exists() {
-                let _ = std::fs::remove_file(&legacy);
-            }
 
-            // Targeted in-memory removal — keeps ephemeral agents and
-            // in-flight conversations alive, unlike a full reload().
             rt.remove_agent(&name);
             rt.hook.unregister_scope(&name);
         }
@@ -500,8 +475,8 @@ impl<P: Provider + 'static, H: Host + 'static> Server for Daemon<P, H> {
     }
 
     async fn list_providers(&self) -> Result<Vec<ProviderInfo>> {
-        let config = self.load_config()?;
-        let (manifest, _) = self.resolve_manifests()?;
+        let config = self.load_config().await?;
+        let (manifest, _) = self.resolve_manifests().await?;
         let active_model = config.system.crab.model.clone().unwrap_or_default();
         Ok(config
             .provider
@@ -593,7 +568,7 @@ impl<P: Provider + 'static, H: Host + 'static> Server for Daemon<P, H> {
             daemon.reload().await?;
 
             // Conflict and auth warnings.
-            let (manifest, mut warnings) = daemon.resolve_manifests()?;
+            let (manifest, mut warnings) = daemon.resolve_manifests().await?;
             warnings.extend(wcore::check_skill_conflicts(&manifest.skill_dirs));
             for w in &warnings {
                 yield plugin_warning(w);
@@ -664,11 +639,7 @@ impl<P: Provider + 'static, H: Host + 'static> Server for Daemon<P, H> {
         sender: String,
     ) -> Result<Vec<ConversationInfo>> {
         let rt = self.runtime.read().await.clone();
-        Ok(scan_sessions(
-            rt.repos().sessions().as_ref(),
-            &agent,
-            &sender,
-        ))
+        Ok(scan_sessions(rt.storage().as_ref(), &agent, &sender))
     }
 
     async fn get_conversation_history(&self, file_path: String) -> Result<ConversationHistory> {
@@ -679,9 +650,8 @@ impl<P: Provider + 'static, H: Host + 'static> Server for Daemon<P, H> {
         let rt = self.runtime.read().await.clone();
         let handle = wcore::repos::SessionHandle::new(&slug);
         let snapshot = rt
-            .repos()
-            .sessions()
-            .load(&handle)?
+            .storage()
+            .load_session(&handle)?
             .ok_or_else(|| anyhow::anyhow!("conversation not found: {slug}"))?;
         let meta = snapshot.meta;
         let messages = snapshot.history;
@@ -708,7 +678,7 @@ impl<P: Provider + 'static, H: Host + 'static> Server for Daemon<P, H> {
         let slug = file_path;
         let rt = self.runtime.read().await.clone();
         let handle = wcore::repos::SessionHandle::new(&slug);
-        let deleted = rt.repos().sessions().delete(&handle)?;
+        let deleted = rt.storage().delete_session(&handle)?;
         if !deleted {
             anyhow::bail!("conversation not found: {slug}");
         }
@@ -716,7 +686,7 @@ impl<P: Provider + 'static, H: Host + 'static> Server for Daemon<P, H> {
     }
 
     async fn list_mcps(&self) -> Result<Vec<McpInfo>> {
-        let config = self.load_config()?;
+        let config = self.load_config().await?;
         let rt = self.runtime.read().await.clone();
         let connected: std::collections::BTreeMap<String, usize> = rt
             .hook
@@ -773,111 +743,44 @@ impl<P: Provider + 'static, H: Host + 'static> Server for Daemon<P, H> {
     }
 
     async fn set_local_mcps(&self, mcps: Vec<McpInfo>) -> Result<()> {
-        use toml_edit::{Array, DocumentMut, Item, Table, value};
-
-        let manifest_path = self
-            .config_dir
-            .join(wcore::paths::LOCAL_DIR)
-            .join("CrabTalk.toml");
-        let local_dir = self.config_dir.join(wcore::paths::LOCAL_DIR);
-        std::fs::create_dir_all(&local_dir)
-            .with_context(|| format!("cannot create {}", local_dir.display()))?;
-
-        let content = if manifest_path.exists() {
-            std::fs::read_to_string(&manifest_path)
-                .with_context(|| format!("cannot read {}", manifest_path.display()))?
-        } else {
-            String::new()
-        };
-        let mut doc: DocumentMut = content
-            .parse()
-            .with_context(|| format!("invalid TOML in {}", manifest_path.display()))?;
-
-        doc.remove("mcps");
-        if !mcps.is_empty() {
-            let mut mcps_table = Table::new();
-            for mcp in &mcps {
-                let mut tbl = Table::new();
-                if !mcp.url.is_empty() {
-                    tbl.insert("url", value(&mcp.url));
+        let rt = self.runtime.read().await.clone();
+        let storage = rt.storage();
+        let mut manifest = storage.load_local_manifest()?;
+        manifest.mcps.clear();
+        for mcp in mcps {
+            let config = wcore::McpServerConfig {
+                name: mcp.name.clone(),
+                command: mcp.command,
+                args: mcp.args,
+                env: mcp.env.into_iter().collect(),
+                auto_restart: mcp.auto_restart,
+                url: if mcp.url.is_empty() {
+                    None
                 } else {
-                    if !mcp.command.is_empty() {
-                        tbl.insert("command", value(&mcp.command));
-                    }
-                    if !mcp.args.is_empty() {
-                        let mut arr = Array::new();
-                        for a in &mcp.args {
-                            arr.push(a.as_str());
-                        }
-                        tbl.insert("args", Item::Value(arr.into()));
-                    }
-                }
-                if mcp.auth {
-                    tbl.insert("auth", value(true));
-                }
-                if mcp.auto_restart {
-                    tbl.insert("auto_restart", value(true));
-                }
-                if !mcp.env.is_empty() {
-                    let mut env_tbl = Table::new();
-                    for (k, v) in &mcp.env {
-                        env_tbl.insert(k, value(v));
-                    }
-                    tbl.insert("env", Item::Table(env_tbl));
-                }
-                mcps_table.insert(&mcp.name, Item::Table(tbl));
-            }
-            doc.insert("mcps", Item::Table(mcps_table));
+                    Some(mcp.url)
+                },
+                auth: mcp.auth,
+            };
+            manifest.mcps.insert(mcp.name, config);
         }
-
-        std::fs::write(&manifest_path, doc.to_string())
-            .with_context(|| format!("failed to write {}", manifest_path.display()))?;
+        storage.save_local_manifest(&manifest)?;
         self.reload().await
     }
 
     async fn set_provider(&self, name: String, config: String) -> Result<ProviderInfo> {
-        use toml_edit::DocumentMut;
-
         let def: wcore::ProviderDef =
             serde_json::from_str(&config).context("invalid ProviderDef JSON")?;
 
-        // Validate before writing: merge with existing providers and check.
-        let daemon_config = self.load_config()?;
-        let mut all_providers = daemon_config.provider;
-        all_providers.insert(name.clone(), def.clone());
-        crate::config::validate_providers(&all_providers)?;
-
-        let toml_value = toml::to_string(&def).context("failed to serialize provider to TOML")?;
-        let provider_doc: DocumentMut = toml_value
-            .parse()
-            .context("failed to parse provider TOML")?;
-
-        let config_path = self.config_dir.join(wcore::paths::CONFIG_FILE);
-        let content = std::fs::read_to_string(&config_path)
-            .with_context(|| format!("cannot read {}", config_path.display()))?;
-        let mut doc: DocumentMut = content
-            .parse()
-            .with_context(|| format!("invalid TOML in {}", config_path.display()))?;
-
-        if doc.get("provider").is_none() {
-            doc.insert("provider", toml_edit::Item::Table(toml_edit::Table::new()));
-        }
-        let provider_table = doc["provider"]
-            .as_table_mut()
-            .context("[provider] is not a table")?;
-
-        let mut entry = toml_edit::Table::new();
-        for (key, value) in provider_doc.as_table().iter() {
-            entry.insert(key, value.clone());
-        }
-        provider_table.insert(&name, toml_edit::Item::Table(entry));
-
-        std::fs::write(&config_path, doc.to_string())
-            .with_context(|| format!("failed to write {}", config_path.display()))?;
+        let rt = self.runtime.read().await.clone();
+        let storage = rt.storage();
+        let mut node_config = storage.load_config()?;
+        node_config.provider.insert(name.clone(), def);
+        wcore::validate_providers(&node_config.provider)?;
+        storage.save_config(&node_config)?;
         self.reload().await?;
 
         // Return the config as actually loaded by the daemon, not the input.
-        let loaded_config = self.load_config()?;
+        let loaded_config = self.load_config().await?;
         let loaded_json = loaded_config
             .provider
             .get(&name)
@@ -898,35 +801,22 @@ impl<P: Provider + 'static, H: Host + 'static> Server for Daemon<P, H> {
     }
 
     async fn delete_provider(&self, name: String) -> Result<()> {
-        use toml_edit::DocumentMut;
-
-        let config_path = self.config_dir.join(wcore::paths::CONFIG_FILE);
-        let content = std::fs::read_to_string(&config_path)
-            .with_context(|| format!("cannot read {}", config_path.display()))?;
-        let mut doc: DocumentMut = content
-            .parse()
-            .with_context(|| format!("invalid TOML in {}", config_path.display()))?;
-
-        let removed = doc
-            .get_mut("provider")
-            .and_then(|v| v.as_table_mut())
-            .and_then(|t| t.remove(&name))
-            .is_some();
-        if !removed {
+        let rt = self.runtime.read().await.clone();
+        let storage = rt.storage();
+        let mut config = storage.load_config()?;
+        if config.provider.remove(&name).is_none() {
             anyhow::bail!("provider '{name}' not found");
         }
-
-        std::fs::write(&config_path, doc.to_string())
-            .with_context(|| format!("failed to write {}", config_path.display()))?;
+        storage.save_config(&config)?;
         self.reload().await
     }
 
     async fn set_active_model(&self, model: String) -> Result<()> {
-        use toml_edit::{DocumentMut, Item, Table, value};
+        let rt = self.runtime.read().await.clone();
+        let storage = rt.storage();
+        let mut config = storage.load_config()?;
 
-        // Validate model exists in some provider.
-        let daemon_config = self.load_config()?;
-        let model_exists = daemon_config
+        let model_exists = config
             .provider
             .values()
             .any(|def| def.models.iter().any(|m| m == &model));
@@ -934,27 +824,8 @@ impl<P: Provider + 'static, H: Host + 'static> Server for Daemon<P, H> {
             anyhow::bail!("model '{model}' not found in any provider");
         }
 
-        let config_path = self.config_dir.join(wcore::paths::CONFIG_FILE);
-        let content = std::fs::read_to_string(&config_path)
-            .with_context(|| format!("cannot read {}", config_path.display()))?;
-        let mut doc: DocumentMut = content
-            .parse()
-            .with_context(|| format!("invalid TOML in {}", config_path.display()))?;
-
-        if doc.get("system").is_none() {
-            doc.insert("system", Item::Table(Table::new()));
-        }
-        if let Some(system) = doc.get_mut("system").and_then(|s| s.as_table_mut()) {
-            if system.get("crab").is_none() {
-                system.insert("crab", Item::Table(Table::new()));
-            }
-            if let Some(crab) = system.get_mut("crab").and_then(|w| w.as_table_mut()) {
-                crab.insert("model", value(&model));
-            }
-        }
-
-        std::fs::write(&config_path, doc.to_string())
-            .with_context(|| format!("failed to write {}", config_path.display()))?;
+        config.system.crab.model = Some(model);
+        storage.save_config(&config)?;
         self.reload().await
     }
 
@@ -972,7 +843,7 @@ impl<P: Provider + 'static, H: Host + 'static> Server for Daemon<P, H> {
     }
 
     async fn list_skills(&self) -> Result<Vec<SkillInfo>> {
-        let (manifest, _) = self.resolve_manifests()?;
+        let (manifest, _) = self.resolve_manifests().await?;
         let local_skills_dir = self.config_dir.join(wcore::paths::SKILLS_DIR);
 
         // Reverse-lookup: dir path → package id.
@@ -1014,7 +885,7 @@ impl<P: Provider + 'static, H: Host + 'static> Server for Daemon<P, H> {
     }
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>> {
-        let config = self.load_config()?;
+        let config = self.load_config().await?;
         let active_model = config.system.crab.model.clone().unwrap_or_default();
 
         let mut models = Vec::new();
@@ -1035,11 +906,12 @@ impl<P: Provider + 'static, H: Host + 'static> Server for Daemon<P, H> {
     }
 
     async fn set_enabled(&self, kind: ResourceKind, name: String, enabled: bool) -> Result<()> {
-        use toml_edit::DocumentMut;
+        let rt = self.runtime.read().await.clone();
+        let storage = rt.storage();
+        let mut config = storage.load_config()?;
 
         // Refuse to disable the active model's provider.
         if !enabled && kind == ResourceKind::Provider {
-            let config = self.load_config()?;
             let active_model = config.system.crab.model.clone().unwrap_or_default();
             if !active_model.is_empty()
                 && config
@@ -1053,45 +925,20 @@ impl<P: Provider + 'static, H: Host + 'static> Server for Daemon<P, H> {
             }
         }
 
-        let config_path = self.config_dir.join(wcore::paths::CONFIG_FILE);
-        let content = std::fs::read_to_string(&config_path)
-            .with_context(|| format!("cannot read {}", config_path.display()))?;
-        let mut doc: DocumentMut = content
-            .parse()
-            .with_context(|| format!("invalid TOML in {}", config_path.display()))?;
-
-        if doc.get("disabled").is_none() {
-            doc.insert("disabled", toml_edit::Item::Table(toml_edit::Table::new()));
-        }
-        let disabled = doc["disabled"]
-            .as_table_mut()
-            .context("[disabled] is not a table")?;
-
-        let key = match kind {
-            ResourceKind::Provider => "providers",
-            ResourceKind::Mcp => "mcps",
-            ResourceKind::Skill => "skills",
-            ResourceKind::ExternalSource => "external",
+        let list = match kind {
+            ResourceKind::Provider => &mut config.disabled.providers,
+            ResourceKind::Mcp => &mut config.disabled.mcps,
+            ResourceKind::Skill => &mut config.disabled.skills,
+            ResourceKind::ExternalSource => &mut config.disabled.external,
             ResourceKind::Unknown => anyhow::bail!("unknown resource kind"),
         };
-        if disabled.get(key).is_none() {
-            disabled.insert(key, toml_edit::Item::Value(toml_edit::Array::new().into()));
-        }
-        let arr = disabled[key]
-            .as_array_mut()
-            .context("disabled list is not an array")?;
-
         if enabled {
-            let idx = arr.iter().position(|v| v.as_str() == Some(&name));
-            if let Some(idx) = idx {
-                arr.remove(idx);
-            }
-        } else if !arr.iter().any(|v| v.as_str() == Some(&name)) {
-            arr.push(&name);
+            list.retain(|v| v != &name);
+        } else if !list.contains(&name) {
+            list.push(name);
         }
 
-        std::fs::write(&config_path, doc.to_string())
-            .with_context(|| format!("failed to write {}", config_path.display()))?;
+        storage.save_config(&config)?;
         self.reload().await
     }
 
@@ -1242,17 +1089,19 @@ fn find_binary(name: &str) -> Result<std::path::PathBuf> {
     anyhow::bail!("binary '{name}' not found in PATH or ~/.cargo/bin")
 }
 
-impl<P: Provider + 'static, H: Host + 'static> Daemon<P, H> {
-    /// Load the current `DaemonConfig` from disk.
-    fn load_config(&self) -> Result<crate::DaemonConfig> {
-        crate::DaemonConfig::load(&self.config_dir.join(wcore::paths::CONFIG_FILE))
+impl<P: Provider + 'static, H: Host + 'static> Node<P, H> {
+    /// Load the current `NodeConfig` via storage.
+    async fn load_config(&self) -> Result<wcore::NodeConfig> {
+        let rt = self.runtime.read().await.clone();
+        rt.storage().load_config()
     }
 
     /// Look up which provider name serves the given model name, by reading
     /// the on-disk config. Returns an empty string if not found or on error.
     /// Used by `send` / `stream_to` to attribute responses to a provider.
-    fn provider_name_for_model(&self, model: &str) -> String {
+    async fn provider_name_for_model(&self, model: &str) -> String {
         self.load_config()
+            .await
             .ok()
             .and_then(|c| {
                 c.provider
@@ -1264,8 +1113,8 @@ impl<P: Provider + 'static, H: Host + 'static> Daemon<P, H> {
     }
 
     /// Resolve manifests and apply disabled items from config.toml.
-    fn resolve_manifests(&self) -> Result<(wcore::ResolvedManifest, Vec<String>)> {
-        let config = self.load_config()?;
+    async fn resolve_manifests(&self) -> Result<(wcore::ResolvedManifest, Vec<String>)> {
+        let config = self.load_config().await?;
         let (mut manifest, warnings) = wcore::resolve_manifests(&self.config_dir);
         manifest.disabled = config.disabled;
         wcore::filter_disabled_external(&mut manifest.skill_dirs, &manifest.disabled.external);
@@ -1278,14 +1127,14 @@ impl<P: Provider + 'static, H: Host + 'static> Daemon<P, H> {
     /// runtime's other state (provider, skills, MCP, memory, ephemeral
     /// agents, in-flight conversations) is preserved.
     async fn register_agent_from_disk(&self, name: &str) -> Result<()> {
-        let config = self.load_config()?;
-        let (manifest, _warnings) = self.resolve_manifests()?;
+        let config = self.load_config().await?;
+        let (manifest, _warnings) = self.resolve_manifests().await?;
         let rt = self.runtime.read().await.clone();
-        let agent_config = crate::daemon::builder::build_single_agent_config(
+        let agent_config = crate::node::builder::build_single_agent_config(
             name,
             &config,
             &manifest,
-            rt.repos().agents().as_ref(),
+            rt.storage().as_ref(),
         )?;
         // `upsert_agent` returns the post-`on_build_agent` config so the
         // dispatch scope matches the form actually stored in the registry.
@@ -1297,8 +1146,9 @@ impl<P: Provider + 'static, H: Host + 'static> Daemon<P, H> {
     /// Look up the stable `AgentId` already recorded for `name` in the
     /// local manifest, if any. Used by update/delete to preserve
     /// identity across edits.
-    fn existing_agent_id(&self, name: &str) -> Result<Option<wcore::AgentId>> {
-        let (manifest, _) = self.resolve_manifests()?;
+    async fn existing_agent_id(&self, name: &str) -> Result<Option<wcore::AgentId>> {
+        let rt = self.runtime.read().await.clone();
+        let manifest = rt.storage().load_local_manifest()?;
         Ok(manifest
             .agents
             .get(name)
@@ -1323,56 +1173,25 @@ impl<P: Provider + 'static, H: Host + 'static> Daemon<P, H> {
     ///
     /// If `expect_new` is true, fails when the agent already exists in the
     /// manifest. If false, upserts (creates or overwrites).
-    fn write_agent_to_manifest(
+    async fn write_agent_to_manifest(
         &self,
         name: &str,
         config_json: &str,
         expect_new: bool,
     ) -> Result<()> {
-        use toml_edit::DocumentMut;
-
-        // Parse incoming JSON to validate it and convert to TOML value.
         let config: wcore::AgentConfig =
             serde_json::from_str(config_json).context("invalid AgentConfig JSON")?;
-        let toml_value = toml::to_string(&config).context("failed to serialize agent to TOML")?;
-        let agent_doc: DocumentMut = toml_value.parse().context("failed to parse agent TOML")?;
 
-        let manifest_path = self
-            .config_dir
-            .join(wcore::paths::LOCAL_DIR)
-            .join("CrabTalk.toml");
-        let mut doc: DocumentMut = if manifest_path.exists() {
-            std::fs::read_to_string(&manifest_path)
-                .context("failed to read local manifest")?
-                .parse()
-                .context("failed to parse local manifest")?
-        } else {
-            DocumentMut::default()
-        };
+        let rt = self.runtime.read().await.clone();
+        let storage = rt.storage();
+        let mut manifest = storage.load_local_manifest()?;
 
-        // Ensure [agents] table exists.
-        if doc.get("agents").is_none() {
-            doc.insert("agents", toml_edit::Item::Table(toml_edit::Table::new()));
-        }
-        let agents = doc["agents"]
-            .as_table_mut()
-            .context("[agents] is not a table")?;
-
-        if expect_new && agents.contains_key(name) {
+        if expect_new && manifest.agents.contains_key(name) {
             anyhow::bail!("agent '{name}' already exists in local manifest");
         }
 
-        // Insert the agent as a sub-table.
-        let mut agent_table = toml_edit::Table::new();
-        for (key, value) in agent_doc.as_table().iter() {
-            agent_table.insert(key, value.clone());
-        }
-        agents.insert(name, toml_edit::Item::Table(agent_table));
-
-        std::fs::create_dir_all(manifest_path.parent().context("no parent dir")?)
-            .context("failed to create local dir")?;
-        std::fs::write(&manifest_path, doc.to_string())
-            .context("failed to write local manifest")?;
+        manifest.agents.insert(name.to_owned(), config);
+        storage.save_local_manifest(&manifest)?;
         Ok(())
     }
 
@@ -1385,48 +1204,20 @@ impl<P: Provider + 'static, H: Host + 'static> Daemon<P, H> {
             id: *id,
             ..Default::default()
         };
-        rt.repos()
-            .agents()
-            .upsert(&config, prompt)
+        rt.storage()
+            .upsert_agent(&config, prompt)
             .with_context(|| format!("failed to write agent prompt for {id}"))
     }
 
     /// Write config into `[system.crab]` in `config.toml`.
-    fn write_system_crab_config(&self, config_json: &str) -> Result<()> {
-        use toml_edit::DocumentMut;
-
-        let config: wcore::AgentConfig =
+    async fn write_system_crab_config(&self, config_json: &str) -> Result<()> {
+        let crab: wcore::AgentConfig =
             serde_json::from_str(config_json).context("invalid AgentConfig JSON")?;
-        let toml_value = toml::to_string(&config).context("failed to serialize agent to TOML")?;
-        let agent_doc: DocumentMut = toml_value.parse().context("failed to parse agent TOML")?;
-
-        let config_path = self.config_dir.join(wcore::paths::CONFIG_FILE);
-        let mut doc: DocumentMut = if config_path.exists() {
-            std::fs::read_to_string(&config_path)
-                .context("failed to read config.toml")?
-                .parse()
-                .context("failed to parse config.toml")?
-        } else {
-            DocumentMut::default()
-        };
-
-        // Ensure [system] table exists.
-        if doc.get("system").is_none() {
-            doc.insert("system", toml_edit::Item::Table(toml_edit::Table::new()));
-        }
-        let system = doc["system"]
-            .as_table_mut()
-            .context("[system] is not a table")?;
-
-        // Build and insert [system.crab] sub-table.
-        let mut crab_table = toml_edit::Table::new();
-        for (key, value) in agent_doc.as_table().iter() {
-            crab_table.insert(key, value.clone());
-        }
-        system.insert("crab", toml_edit::Item::Table(crab_table));
-
-        std::fs::write(&config_path, doc.to_string()).context("failed to write config.toml")?;
-        Ok(())
+        let rt = self.runtime.read().await.clone();
+        let storage = rt.storage();
+        let mut config = storage.load_config()?;
+        config.system.crab = crab;
+        storage.save_config(&config)
     }
 }
 
@@ -1475,8 +1266,8 @@ fn plugin_output(content: &str) -> PluginEvent {
 /// Scan sessions out of the runtime Storage and return conversation info.
 ///
 /// List conversations via the session repo.
-fn scan_sessions(repo: &impl SessionRepo, agent: &str, sender: &str) -> Vec<ConversationInfo> {
-    let Ok(summaries) = repo.list_sessions() else {
+fn scan_sessions(storage: &impl Storage, agent: &str, sender: &str) -> Vec<ConversationInfo> {
+    let Ok(summaries) = storage.list_sessions() else {
         return Vec::new();
     };
 

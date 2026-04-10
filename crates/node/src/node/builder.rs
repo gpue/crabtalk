@@ -1,11 +1,10 @@
-//! Daemon construction and lifecycle methods.
+//! Node construction and lifecycle methods.
 
 use crate::mcp::McpHandler;
 use crate::{
-    Daemon, DaemonConfig,
-    config::{ResolvedManifest, resolve_manifests},
-    daemon::event::{DaemonEvent, DaemonEventSender},
-    repos::{DaemonRepos, FsAgentRepo, FsMemoryRepo, FsSessionRepo, FsSkillRepo},
+    Node, NodeConfig,
+    node::event::{NodeEvent, NodeEventSender},
+    storage::FsStorage,
 };
 use anyhow::Result;
 use crabllm_core::Provider;
@@ -17,14 +16,15 @@ use std::{
     sync::Arc,
 };
 use tokio::sync::{Mutex, RwLock, broadcast};
-use wcore::{AgentConfig, Runtime, ToolRequest, model::Model, repos::Repos};
+use wcore::{AgentConfig, Runtime, ToolRequest, model::Model, repos::Storage};
+use wcore::{ResolvedManifest, resolve_manifests};
 
 pub type DefaultProvider = crate::provider::Retrying<ProviderRegistry<RemoteProvider>>;
 
 pub type BuildProvider<P> =
-    Arc<dyn Fn(&DaemonConfig) -> Result<wcore::model::Model<P>> + Send + Sync>;
+    Arc<dyn Fn(&NodeConfig) -> Result<wcore::model::Model<P>> + Send + Sync>;
 
-pub fn build_default_provider(config: &DaemonConfig) -> Result<Model<DefaultProvider>> {
+pub fn build_default_provider(config: &NodeConfig) -> Result<Model<DefaultProvider>> {
     build_providers(config)
 }
 
@@ -33,9 +33,9 @@ pub(crate) const SYSTEM_AGENT: &str = runtime::memory::DEFAULT_SOUL;
 /// Build the `AgentConfig` for a single named agent.
 pub(crate) fn build_single_agent_config(
     name: &str,
-    config: &DaemonConfig,
+    config: &NodeConfig,
     manifest: &ResolvedManifest,
-    agent_repo: &impl wcore::repos::AgentRepo,
+    storage: &impl Storage,
 ) -> Result<AgentConfig> {
     let default_model = config
         .system
@@ -59,9 +59,9 @@ pub(crate) fn build_single_agent_config(
         .get(name)
         .ok_or_else(|| anyhow::anyhow!("agent '{name}' not found in manifest"))?;
 
-    let prompts = crate::config::load_agents_dirs(&manifest.agent_dirs)?;
+    let prompts = wcore::load_agents_dirs(&manifest.agent_dirs)?;
     let prompt_map: BTreeMap<String, String> = prompts.into_iter().collect();
-    let prompt = resolve_agent_prompt(agent_repo, agent_config, name, &prompt_map)
+    let prompt = resolve_agent_prompt(storage, agent_config, name, &prompt_map)
         .ok_or_else(|| anyhow::anyhow!("agent '{name}' has no prompt"))?;
 
     let mut agent = agent_config.clone();
@@ -73,16 +73,16 @@ pub(crate) fn build_single_agent_config(
     Ok(agent)
 }
 
-impl<P: Provider + 'static, H: Host + 'static> Daemon<P, H> {
+impl<P: Provider + 'static, H: Host + 'static> Node<P, H> {
     pub(crate) async fn build(
-        config: &DaemonConfig,
+        config: &NodeConfig,
         config_dir: &Path,
-        event_tx: DaemonEventSender,
+        event_tx: NodeEventSender,
         shutdown_tx: broadcast::Sender<()>,
         host: H,
         build_provider: BuildProvider<P>,
     ) -> Result<Self> {
-        if let Err(e) = crate::config::backfill_local_agent_ids(config_dir) {
+        if let Err(e) = crate::storage::backfill_local_agent_ids(config_dir) {
             tracing::warn!("agent id backfill failed: {e}");
         }
 
@@ -105,7 +105,7 @@ impl<P: Provider + 'static, H: Host + 'static> Daemon<P, H> {
                 guest: None,
                 tool_choice: None,
             });
-            let _ = fire_tx.send(DaemonEvent::Message {
+            let _ = fire_tx.send(NodeEvent::Message {
                 msg,
                 reply: reply_tx,
             });
@@ -124,7 +124,7 @@ impl<P: Provider + 'static, H: Host + 'static> Daemon<P, H> {
     }
 
     pub async fn reload(&self) -> Result<()> {
-        let config = DaemonConfig::load(&self.config_dir.join(wcore::paths::CONFIG_FILE))?;
+        let config = NodeConfig::load(&self.config_dir.join(wcore::paths::CONFIG_FILE))?;
         let host = {
             let old_rt = self.runtime.read().await;
             old_rt.hook.host.clone()
@@ -149,17 +149,23 @@ impl<P: Provider + 'static, H: Host + 'static> Daemon<P, H> {
     }
 
     async fn build_runtime(
-        config: &DaemonConfig,
+        config: &NodeConfig,
         config_dir: &Path,
-        event_tx: &DaemonEventSender,
-        host: H,
+        event_tx: &NodeEventSender,
+        mut host: H,
         build_provider: &BuildProvider<P>,
-    ) -> Result<Runtime<P, Env<H, DaemonRepos>>> {
+    ) -> Result<Runtime<P, Env<H, FsStorage>>> {
         let (mut manifest, _warnings) = resolve_manifests(config_dir);
         manifest.disabled = config.disabled.clone();
         wcore::filter_disabled_external(&mut manifest.skill_dirs, &manifest.disabled.external);
         let model = build_provider(config)?;
-        let hook = build_env(config, config_dir, &manifest, host).await?;
+
+        // Build MCP before the env so the host has it from the start.
+        let servers = mcp_servers(config, &manifest);
+        let mcp_handler: Arc<McpHandler> = Arc::new(McpHandler::load(&servers).await);
+        host.set_mcp(mcp_handler);
+
+        let hook = build_env(config, config_dir, &manifest, host)?;
         let tool_tx = build_tool_sender(event_tx);
         let mut runtime = Runtime::new(model, hook, Some(tool_tx)).await;
         load_agents(&mut runtime, config_dir, config, &manifest)?;
@@ -167,7 +173,7 @@ impl<P: Provider + 'static, H: Host + 'static> Daemon<P, H> {
     }
 }
 
-fn build_providers(config: &DaemonConfig) -> Result<Model<DefaultProvider>> {
+fn build_providers(config: &NodeConfig) -> Result<Model<DefaultProvider>> {
     let providers: HashMap<String, _> = config
         .provider
         .iter()
@@ -186,42 +192,9 @@ fn build_providers(config: &DaemonConfig) -> Result<Model<DefaultProvider>> {
     Ok(Model::new(retrying))
 }
 
-async fn build_env<H: Host>(
-    config: &DaemonConfig,
-    config_dir: &Path,
-    manifest: &ResolvedManifest,
-    mut host: H,
-) -> Result<Env<H, DaemonRepos>> {
-    // Build repos.
-    let skill_roots: Vec<PathBuf> = manifest
-        .skill_dirs
-        .iter()
-        .filter(|dir| dir.exists())
-        .cloned()
-        .collect();
-    let memory_root = config_dir.join("memory");
-    let sessions_root = config_dir.join("sessions");
-
-    let repos = DaemonRepos {
-        memory: Arc::new(FsMemoryRepo::new(memory_root)),
-        skills: Arc::new(FsSkillRepo::new(
-            skill_roots,
-            manifest.disabled.skills.clone(),
-        )),
-        sessions: Arc::new(FsSessionRepo::new(sessions_root)),
-        agents: Arc::new(FsAgentRepo::new(
-            config_dir.to_path_buf(),
-            manifest.agent_dirs.clone(),
-        )),
-    };
-
-    // MCP servers.
-    // Note: McpHandler::load is async but we're in a sync context here.
-    // The daemon builder calls this from an async context, so we use
-    // block_in_place. Actually, let me keep this sync by making build_env async.
-    // ... Actually the old code was async too. Let me make this async.
-    // For now, let's just create the handler with an empty list and load later.
-    let mcp_servers: Vec<_> = manifest
+/// Build MCP server configs from manifest + node config env vars.
+fn mcp_servers(config: &NodeConfig, manifest: &ResolvedManifest) -> Vec<wcore::McpServerConfig> {
+    manifest
         .mcps
         .iter()
         .filter(|(name, _)| !manifest.disabled.mcps.contains(name))
@@ -232,26 +205,44 @@ async fn build_env<H: Host>(
             }
             mcp
         })
-        .collect();
-
-    let memory = Some(Memory::open(
-        config.system.memory.clone(),
-        repos.memory.clone(),
-    ));
-
-    let cwd = std::env::current_dir().unwrap_or_else(|_| config_dir.to_path_buf());
-
-    let mcp_handler: Arc<McpHandler> = Arc::new(McpHandler::load(&mcp_servers).await);
-    host.set_mcp(mcp_handler);
-    Ok(Env::new(repos, cwd, memory, host))
+        .collect()
 }
 
-fn build_tool_sender(event_tx: &DaemonEventSender) -> wcore::ToolSender {
+fn build_env<H: Host>(
+    config: &NodeConfig,
+    config_dir: &Path,
+    manifest: &ResolvedManifest,
+    host: H,
+) -> Result<Env<H, FsStorage>> {
+    let skill_roots: Vec<PathBuf> = manifest
+        .skill_dirs
+        .iter()
+        .filter(|dir| dir.exists())
+        .cloned()
+        .collect();
+    let memory_root = config_dir.join("memory");
+    let sessions_root = config_dir.join("sessions");
+
+    let storage = Arc::new(FsStorage::new(
+        config_dir.to_path_buf(),
+        memory_root,
+        sessions_root,
+        skill_roots,
+        manifest.disabled.skills.clone(),
+        manifest.agent_dirs.clone(),
+    ));
+
+    let memory = Some(Memory::open(config.system.memory.clone(), storage.clone()));
+    let cwd = std::env::current_dir().unwrap_or_else(|_| config_dir.to_path_buf());
+    Ok(Env::new(storage, cwd, memory, host))
+}
+
+fn build_tool_sender(event_tx: &NodeEventSender) -> wcore::ToolSender {
     let (tool_tx, mut tool_rx) = tokio::sync::mpsc::unbounded_channel::<ToolRequest>();
     let event_tx = event_tx.clone();
     tokio::spawn(async move {
         while let Some(req) = tool_rx.recv().await {
-            if event_tx.send(DaemonEvent::ToolCall(req)).is_err() {
+            if event_tx.send(NodeEvent::ToolCall(req)).is_err() {
                 break;
             }
         }
@@ -260,21 +251,21 @@ fn build_tool_sender(event_tx: &DaemonEventSender) -> wcore::ToolSender {
 }
 
 fn load_agents<P: Provider + 'static, H: Host + 'static>(
-    runtime: &mut Runtime<P, Env<H, DaemonRepos>>,
+    runtime: &mut Runtime<P, Env<H, FsStorage>>,
     config_dir: &Path,
-    config: &DaemonConfig,
+    config: &NodeConfig,
     manifest: &ResolvedManifest,
 ) -> Result<()> {
     // One-shot migration: hoist legacy prompt files into ULID-keyed storage.
-    if let Err(e) = crate::config::migrate_local_agent_prompts(
+    if let Err(e) = crate::storage::migrate_local_agent_prompts(
         config_dir,
         manifest,
-        runtime.repos().agents().as_ref(),
+        runtime.storage().as_ref(),
     ) {
         tracing::warn!("local agent prompt migration failed: {e}");
     }
 
-    let prompts = crate::config::load_agents_dirs(&manifest.agent_dirs)?;
+    let prompts = wcore::load_agents_dirs(&manifest.agent_dirs)?;
     let prompt_map: BTreeMap<String, String> = prompts.into_iter().collect();
 
     let default_model = config
@@ -291,7 +282,7 @@ fn load_agents<P: Provider + 'static, H: Host + 'static>(
     runtime.add_agent(crab_config);
 
     // Sub-agents from manifests.
-    let agent_repo = runtime.repos().agents().clone();
+    let storage = runtime.storage().clone();
     for (name, agent_config) in &manifest.agents {
         if name == wcore::paths::DEFAULT_AGENT {
             tracing::warn!(
@@ -300,8 +291,7 @@ fn load_agents<P: Provider + 'static, H: Host + 'static>(
             );
             continue;
         }
-        let Some(prompt) =
-            resolve_agent_prompt(agent_repo.as_ref(), agent_config, name, &prompt_map)
+        let Some(prompt) = resolve_agent_prompt(storage.as_ref(), agent_config, name, &prompt_map)
         else {
             tracing::warn!("agent '{name}' has no prompt, skipping");
             continue;
@@ -346,13 +336,13 @@ fn load_agents<P: Provider + 'static, H: Host + 'static>(
 /// Resolve an agent's prompt, preferring the repo (ULID key) and falling
 /// back to the legacy filesystem prompt map.
 fn resolve_agent_prompt(
-    repo: &impl wcore::repos::AgentRepo,
+    storage: &impl Storage,
     config: &AgentConfig,
     name: &str,
     prompt_map: &BTreeMap<String, String>,
 ) -> Option<String> {
     if !config.id.is_nil()
-        && let Ok(Some(loaded)) = repo.load(&config.id)
+        && let Ok(Some(loaded)) = storage.load_agent(&config.id)
         && !loaded.system_prompt.is_empty()
     {
         return Some(loaded.system_prompt);

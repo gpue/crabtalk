@@ -1,9 +1,9 @@
-//! DaemonHost — server-specific Host implementation.
+//! NodeHost — server-specific Host implementation.
 //!
 //! Provides `ask_user` and `delegate` dispatch using daemon event channels,
 //! per-session CWD resolution, and agent event broadcasting.
 
-use crate::daemon::event::{DaemonEvent, DaemonEventSender};
+use crate::node::event::{NodeEvent, NodeEventSender};
 use runtime::host::Host;
 use std::{
     collections::HashMap,
@@ -34,9 +34,9 @@ const ASK_USER_TIMEOUT: Duration = Duration::from_secs(300);
 /// Server-specific host for the daemon. Owns event channels, session state,
 /// and the MCP bridge (subprocess/HTTP connections to MCP tool servers).
 #[derive(Clone)]
-pub struct DaemonHost {
+pub struct NodeHost {
     /// Event channel for task delegation.
-    pub(crate) event_tx: DaemonEventSender,
+    pub(crate) event_tx: NodeEventSender,
     /// Pending `ask_user` oneshots, keyed by conversation_id.
     pub(crate) pending_asks: Arc<Mutex<HashMap<u64, oneshot::Sender<String>>>>,
     /// Per-conversation working directory overrides.
@@ -48,7 +48,7 @@ pub struct DaemonHost {
     pub(crate) mcp: Arc<crate::mcp::McpHandler>,
 }
 
-impl Host for DaemonHost {
+impl Host for NodeHost {
     async fn dispatch_ask_user(
         &self,
         args: &str,
@@ -101,7 +101,7 @@ impl Host for DaemonHost {
                 let (tx, rx) = oneshot::channel();
                 let _ = self
                     .event_tx
-                    .send(DaemonEvent::AddEphemeral { config, reply: tx });
+                    .send(NodeEvent::AddEphemeral { config, reply: tx });
                 let _ = rx.await;
                 ephemeral_names.push(name.clone());
                 name
@@ -135,7 +135,7 @@ impl Host for DaemonHost {
                         let _ = h.await;
                     }
                     for name in ephemeral_names {
-                        let _ = event_tx.send(DaemonEvent::RemoveEphemeral { name });
+                        let _ = event_tx.send(NodeEvent::RemoveEphemeral { name });
                     }
                 });
             }
@@ -158,7 +158,7 @@ impl Host for DaemonHost {
 
         // Clean up ephemeral agents after foreground tasks complete.
         for name in ephemeral_names {
-            let _ = self.event_tx.send(DaemonEvent::RemoveEphemeral { name });
+            let _ = self.event_tx.send(NodeEvent::RemoveEphemeral { name });
         }
 
         serde_json::to_string(&results).map_err(|e| format!("serialization error: {e}"))
@@ -294,7 +294,7 @@ impl Host for DaemonHost {
         // Publish agent completion to the event bus.
         if let AgentEvent::Done(response) = event {
             let payload = response.final_response.clone().unwrap_or_default();
-            let _ = self.event_tx.send(DaemonEvent::PublishEvent {
+            let _ = self.event_tx.send(NodeEvent::PublishEvent {
                 source: format!("agent:{}:done", agent),
                 payload,
             });
@@ -343,7 +343,7 @@ impl Host for DaemonHost {
     }
 
     fn mcp_tools(&self) -> Vec<wcore::model::Tool> {
-        vec![runtime::mcp::tool::Mcp::as_tool()]
+        vec![crate::mcp::tool::Mcp::as_tool()]
     }
 
     fn set_mcp(&mut self, handler: std::sync::Arc<dyn std::any::Any + Send + Sync>) {
@@ -412,7 +412,7 @@ fn spawn_agent_task(
     message: String,
     cwd: Option<String>,
     delegate_sender: String,
-    event_tx: DaemonEventSender,
+    event_tx: NodeEventSender,
 ) -> tokio::task::JoinHandle<(Option<String>, Option<String>)> {
     tokio::spawn(async move {
         let (reply_tx, mut reply_rx) = mpsc::channel(transport::REPLY_CHANNEL_CAPACITY);
@@ -425,7 +425,7 @@ fn spawn_agent_task(
             tool_choice: None,
         });
         if event_tx
-            .send(DaemonEvent::Message {
+            .send(NodeEvent::Message {
                 msg,
                 reply: reply_tx,
             })
@@ -451,7 +451,7 @@ fn spawn_agent_task(
 
         // Kill the delegate conversation after completion.
         let (reply_tx, _) = mpsc::channel(1);
-        let _ = event_tx.send(DaemonEvent::Message {
+        let _ = event_tx.send(NodeEvent::Message {
             msg: ClientMessage {
                 msg: Some(wcore::protocol::message::client_message::Msg::Kill(
                     wcore::protocol::message::KillMsg {
