@@ -50,6 +50,7 @@ pub struct Node<P: Provider + 'static = DefaultProvider, B: Host + 'static = Nod
     pub(crate) crons: Arc<Mutex<CronStore>>,
     pub(crate) events: Arc<Mutex<EventBus>>,
     pub(crate) build_provider: BuildProvider<P>,
+    pub(crate) mcp: Arc<crate::mcp::McpHandler>,
 }
 
 impl<P: Provider + 'static, B: Host + 'static> Clone for Node<P, B> {
@@ -62,6 +63,7 @@ impl<P: Provider + 'static, B: Host + 'static> Clone for Node<P, B> {
             crons: self.crons.clone(),
             events: self.events.clone(),
             build_provider: Arc::clone(&self.build_provider),
+            mcp: self.mcp.clone(),
         }
     }
 }
@@ -75,10 +77,7 @@ impl Node<DefaultProvider, NodeHost> {
                 let (events_tx, _) = broadcast::channel(256);
                 NodeHost {
                     event_tx,
-                    pending_asks: Arc::new(Mutex::new(std::collections::HashMap::new())),
-                    conversation_cwds: Arc::new(Mutex::new(std::collections::HashMap::new())),
                     events_tx,
-                    mcp: Arc::new(crate::mcp::McpHandler::empty()),
                 }
             },
         )

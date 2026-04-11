@@ -1,6 +1,7 @@
 //! Crabtalk node — runtime + transport + event loop.
 
 pub mod cron;
+pub mod delegate;
 pub mod event_bus;
 pub mod hook;
 pub mod mcp;
@@ -18,4 +19,5 @@ pub use node::{
     event::{NodeEvent, NodeEventSender},
     setup_tcp,
 };
+pub use tools::Memory;
 pub use wcore::NodeConfig;

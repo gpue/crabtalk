@@ -15,7 +15,7 @@ use wcore::{
 };
 
 pub mod bm25;
-pub mod tool;
+pub mod handlers;
 
 /// Re-exports from wcore for external consumers.
 pub mod entry {

@@ -9,13 +9,14 @@ use crate::{
 use anyhow::Result;
 use crabllm_core::Provider;
 use crabllm_provider::{ProviderRegistry, RemoteProvider};
-use runtime::{Env, Runtime, host::Host, memory::Memory};
+use runtime::{Env, Runtime, host::Host};
 use std::{
     collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
     sync::Arc,
 };
 use tokio::sync::{Mutex, RwLock, broadcast};
+use tools::Memory;
 use wcore::{AgentConfig, ToolRequest, model::Model, repos::Storage};
 use wcore::{ResolvedManifest, resolve_manifests};
 
@@ -28,7 +29,7 @@ pub fn build_default_provider(config: &NodeConfig) -> Result<Model<DefaultProvid
     build_providers(config)
 }
 
-pub(crate) const SYSTEM_AGENT: &str = runtime::memory::DEFAULT_SOUL;
+pub(crate) const SYSTEM_AGENT: &str = tools::memory::DEFAULT_SOUL;
 
 /// Build the `AgentConfig` for a single named agent.
 pub(crate) fn build_single_agent_config(
@@ -86,7 +87,7 @@ impl<P: Provider + 'static, H: Host + 'static> Node<P, H> {
             tracing::warn!("agent id backfill failed: {e}");
         }
 
-        let runtime =
+        let (runtime, mcp) =
             Self::build_runtime(config, config_dir, &event_tx, host, &build_provider).await?;
         let cron_store =
             crate::cron::CronStore::load(config_dir.to_path_buf(), event_tx.clone(), shutdown_tx);
@@ -120,6 +121,7 @@ impl<P: Provider + 'static, H: Host + 'static> Node<P, H> {
             crons,
             events,
             build_provider,
+            mcp,
         })
     }
 
@@ -129,7 +131,7 @@ impl<P: Provider + 'static, H: Host + 'static> Node<P, H> {
             let old_rt = self.runtime.read().await;
             old_rt.hook.host.clone()
         };
-        let mut new_runtime = Self::build_runtime(
+        let (mut new_runtime, _mcp) = Self::build_runtime(
             &config,
             &self.config_dir,
             &self.event_tx,
@@ -152,24 +154,29 @@ impl<P: Provider + 'static, H: Host + 'static> Node<P, H> {
         config: &NodeConfig,
         config_dir: &Path,
         event_tx: &NodeEventSender,
-        mut host: H,
+        host: H,
         build_provider: &BuildProvider<P>,
-    ) -> Result<Runtime<crate::node::NodeCfg<P, H>>> {
+    ) -> Result<(Runtime<crate::node::NodeCfg<P, H>>, Arc<McpHandler>)> {
         let (mut manifest, _warnings) = resolve_manifests(config_dir);
         manifest.disabled = config.disabled.clone();
         wcore::filter_disabled_external(&mut manifest.skill_dirs, &manifest.disabled.external);
         let model = build_provider(config)?;
 
-        // Build MCP before the env so the host has it from the start.
         let servers = mcp_servers(config, &manifest);
         let mcp_handler: Arc<McpHandler> = Arc::new(McpHandler::load(&servers).await);
-        host.set_mcp(mcp_handler);
 
-        let (hook, storage) = build_env(config, config_dir, &manifest, host)?;
+        let (hook, storage, tools) = build_env(
+            config,
+            config_dir,
+            &manifest,
+            host,
+            event_tx.clone(),
+            mcp_handler.clone(),
+        )?;
         let tool_tx = build_tool_sender(event_tx);
-        let mut runtime = Runtime::new(model, hook, storage, Some(tool_tx)).await;
+        let mut runtime = Runtime::new(model, hook, storage, Some(tool_tx), tools);
         load_agents(&mut runtime, config_dir, config, &manifest)?;
-        Ok(runtime)
+        Ok((runtime, mcp_handler))
     }
 }
 
@@ -208,12 +215,14 @@ fn mcp_servers(config: &NodeConfig, manifest: &ResolvedManifest) -> Vec<wcore::M
         .collect()
 }
 
-fn build_env<H: Host>(
+fn build_env<H: Host + 'static>(
     config: &NodeConfig,
     config_dir: &Path,
     manifest: &ResolvedManifest,
     host: H,
-) -> Result<(Env<H, FsStorage>, Arc<FsStorage>)> {
+    event_tx: NodeEventSender,
+    mcp_handler: Arc<McpHandler>,
+) -> Result<(Env<H, FsStorage>, Arc<FsStorage>, wcore::ToolRegistry)> {
     let skill_roots: Vec<PathBuf> = manifest
         .skill_dirs
         .iter()
@@ -232,9 +241,89 @@ fn build_env<H: Host>(
         manifest.agent_dirs.clone(),
     ));
 
-    let memory = Some(Memory::open(config.system.memory.clone(), storage.clone()));
+    let memory = Arc::new(Memory::open(config.system.memory.clone(), storage.clone()));
     let cwd = std::env::current_dir().unwrap_or_else(|_| config_dir.to_path_buf());
-    Ok((Env::new(storage.clone(), cwd, memory, host), storage))
+    let scopes = Arc::new(std::sync::RwLock::new(BTreeMap::new()));
+
+    let conversation_cwds: runtime::ConversationCwds =
+        Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+    let pending_asks: runtime::PendingAsks =
+        Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+    let mcp_server_list = mcp_handler.cached_list();
+
+    let mut env = Env::new(
+        storage.clone(),
+        cwd.clone(),
+        host,
+        scopes.clone(),
+        conversation_cwds.clone(),
+        pending_asks.clone(),
+    );
+
+    // Register tools.
+    let mut tools = wcore::ToolRegistry::new();
+
+    let register =
+        |tools: &mut wcore::ToolRegistry, env: &mut Env<H, FsStorage>, entry: wcore::ToolEntry| {
+            tools.insert(entry.schema.clone());
+            env.register_tool(entry);
+        };
+
+    register(
+        &mut tools,
+        &mut env,
+        tools::os::bash(cwd.clone(), conversation_cwds.clone()),
+    );
+    register(
+        &mut tools,
+        &mut env,
+        tools::os::read(cwd.clone(), conversation_cwds.clone()),
+    );
+    register(
+        &mut tools,
+        &mut env,
+        tools::os::edit(cwd, conversation_cwds),
+    );
+
+    for entry in tools::memory::handlers::handlers(memory) {
+        register(&mut tools, &mut env, entry);
+    }
+
+    register(
+        &mut tools,
+        &mut env,
+        tools::skill::handler::handler(storage.clone(), scopes.clone()),
+    );
+    register(
+        &mut tools,
+        &mut env,
+        crate::delegate::handler(event_tx, scopes.clone()),
+    );
+    register(&mut tools, &mut env, tools::ask_user::handler(pending_asks));
+
+    // MCP — register only if servers are configured.
+    if !mcp_handler.cached_list().is_empty() {
+        let mcp_prompt = format!(
+            "\n\n<resources>\nMCP servers: {}. Use the mcp tool to list or call tools.\n</resources>",
+            mcp_server_list
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        register(
+            &mut tools,
+            &mut env,
+            wcore::ToolEntry {
+                schema: <crate::mcp::tool::Mcp as wcore::agent::AsTool>::as_tool(),
+                handler: crate::mcp::tool::handler(mcp_handler, scopes.clone()),
+                system_prompt: Some(mcp_prompt),
+                before_run: None,
+            },
+        );
+    }
+
+    Ok((env, storage, tools))
 }
 
 fn build_tool_sender(event_tx: &NodeEventSender) -> wcore::ToolSender {

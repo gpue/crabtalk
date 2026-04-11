@@ -39,9 +39,10 @@ impl<P: Provider + 'static, H: Host + 'static> Server for Node<P, H> {
             .await?;
         if let Some(ref cwd) = cwd {
             rt.hook
-                .host
-                .set_conversation_cwd(conversation_id, cwd.clone())
-                .await;
+                .conversation_cwds
+                .lock()
+                .await
+                .insert(conversation_id, cwd.clone());
         }
         let tool_choice = req
             .tool_choice
@@ -77,7 +78,7 @@ impl<P: Provider + 'static, H: Host + 'static> Server for Node<P, H> {
             let created_by = if sender.is_empty() { "user".into() } else { sender.clone() };
             let conversation_id = rt.get_or_create_conversation(&agent, created_by.as_str()).await?;
             if let Some(ref cwd) = cwd {
-                rt.hook.host.set_conversation_cwd(conversation_id, cwd.clone()).await;
+                rt.hook.conversation_cwds.lock().await.insert(conversation_id, cwd.clone());
             }
 
             let responding_agent = if guest.is_empty() { agent.clone() } else { guest.clone() };
@@ -123,7 +124,7 @@ impl<P: Provider + 'static, H: Host + 'static> Server for Node<P, H> {
                             .iter()
                             .filter(|c| c.function.name == "ask_user")
                             .filter_map(|c| {
-                                serde_json::from_str::<runtime::ask_user::AskUser>(&c.function.arguments)
+                                serde_json::from_str::<tools::ask_user::AskUser>(&c.function.arguments)
                                     .ok()
                             })
                             .flat_map(|a| a.questions)
@@ -228,7 +229,11 @@ impl<P: Provider + 'static, H: Host + 'static> Server for Node<P, H> {
         let Some(conversation_id) = rt.find_conversation_id(&agent, &sender).await else {
             return Ok(false);
         };
-        rt.hook.host.clear_conversation_state(conversation_id).await;
+        rt.hook
+            .conversation_cwds
+            .lock()
+            .await
+            .remove(&conversation_id);
         Ok(rt.close_conversation(conversation_id).await)
     }
 
@@ -351,7 +356,15 @@ impl<P: Provider + 'static, H: Host + 'static> Server for Node<P, H> {
             .ok_or_else(|| {
                 anyhow::anyhow!("conversation not found for agent='{agent}' sender='{sender}'")
             })?;
-        if rt.hook.host.reply_to_ask(conversation_id, content).await? {
+        if let Some(tx) = rt.hook.pending_asks.lock().await.remove(&conversation_id) {
+            let _ = tx.send(content);
+            return Ok(());
+        }
+        // Retry once after a short delay — the ask_user handler may not have
+        // inserted the oneshot yet if the reply races the tool call.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        if let Some(tx) = rt.hook.pending_asks.lock().await.remove(&conversation_id) {
+            let _ = tx.send(content);
             return Ok(());
         }
         anyhow::bail!("no pending ask_user for agent='{agent}' sender='{sender}'")
@@ -687,10 +700,9 @@ impl<P: Provider + 'static, H: Host + 'static> Server for Node<P, H> {
 
     async fn list_mcps(&self) -> Result<Vec<McpInfo>> {
         let config = self.load_config().await?;
-        let rt = self.runtime.read().await.clone();
-        let connected: std::collections::BTreeMap<String, usize> = rt
-            .hook
-            .mcp_servers()
+        let connected: std::collections::BTreeMap<String, usize> = self
+            .mcp
+            .cached_list()
             .into_iter()
             .map(|(name, tools)| (name, tools.len()))
             .collect();

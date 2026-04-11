@@ -6,10 +6,11 @@
 //! call and awaits a `Result<String, String>` reply — `Ok` carries normal
 //! output, `Err` carries an error message the UI can render distinctly.
 
+use crate::model::HistoryEntry;
 use crabllm_core::{FunctionDef, Tool, ToolType};
 use heck::ToSnakeCase;
 use schemars::JsonSchema;
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, future::Future, pin::Pin, sync::Arc};
 use tokio::sync::{mpsc, oneshot};
 
 /// Sender half of the agent tool channel.
@@ -40,6 +41,40 @@ pub struct ToolRequest {
     /// Conversation ID, if running within a conversation.
     /// Set by the runtime; the agent passes it through as an opaque value.
     pub conversation_id: Option<u64>,
+}
+
+/// Arguments passed to a tool handler during dispatch.
+pub struct ToolDispatch {
+    /// JSON-encoded arguments string.
+    pub args: String,
+    /// Name of the agent making this call.
+    pub agent: String,
+    /// Sender identity (empty for local/owner conversations).
+    pub sender: String,
+    /// Conversation ID, if running within a conversation.
+    pub conversation_id: Option<u64>,
+}
+
+/// A type-erased async tool handler.
+pub type ToolHandler = Arc<
+    dyn Fn(ToolDispatch) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Callback invoked before each agent run to inject context entries.
+pub type BeforeRunHook = Arc<dyn Fn(&[HistoryEntry]) -> Vec<HistoryEntry> + Send + Sync>;
+
+/// A registered tool: schema + handler + optional lifecycle hooks.
+pub struct ToolEntry {
+    /// Tool schema for the LLM.
+    pub schema: Tool,
+    /// Dispatch handler.
+    pub handler: ToolHandler,
+    /// Appended to agent system prompt at build time.
+    pub system_prompt: Option<String>,
+    /// Injected before each agent turn (auto-recall, context, etc).
+    pub before_run: Option<BeforeRunHook>,
 }
 
 /// Schema-only registry of named tools.
@@ -108,6 +143,20 @@ impl ToolRegistry {
             .filter(|(k, _)| names.iter().any(|n| n == *k))
             .map(|(_, v)| v.clone())
             .collect()
+    }
+}
+
+/// Create a minimal tool schema for testing.
+#[cfg(feature = "test-utils")]
+pub fn test_schema(name: &str) -> Tool {
+    Tool {
+        kind: ToolType::Function,
+        function: FunctionDef {
+            name: name.to_owned(),
+            description: None,
+            parameters: None,
+        },
+        strict: None,
     }
 }
 

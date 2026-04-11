@@ -1,25 +1,26 @@
 //! Env — the embeddable engine environment.
 //!
-//! [`Env`] composes skill, MCP, OS, and memory sub-hooks. It implements
-//! `wcore::Hook` and provides the central `dispatch_tool` entry point.
-//! Server-specific tools (`ask_user`, `delegate`) are routed through the
-//! [`Host`](crate::host::Host).
+//! [`Env`] implements `wcore::Hook` and provides the central `dispatch_tool`
+//! entry point. Tool handlers are registered dynamically at startup — there
+//! is no hardcoded dispatch table.
 
-use crate::{host::Host, memory::Memory, os, skill};
+use crate::host::Host;
 use std::{
     collections::BTreeMap,
     path::PathBuf,
     sync::{Arc, RwLock},
 };
-use wcore::{AgentConfig, AgentEvent, Hook, model::HistoryEntry, repos::Storage};
+use wcore::{
+    AgentConfig, AgentEvent, Hook, ToolDispatch, ToolEntry, model::HistoryEntry, repos::Storage,
+};
 
 /// Per-agent scope for dispatch enforcement. Empty vecs = unrestricted.
 #[derive(Default)]
 pub struct AgentScope {
-    pub(crate) tools: Vec<String>,
-    pub(crate) members: Vec<String>,
-    pub(crate) skills: Vec<String>,
-    pub(crate) mcps: Vec<String>,
+    pub tools: Vec<String>,
+    pub members: Vec<String>,
+    pub skills: Vec<String>,
+    pub mcps: Vec<String>,
 }
 
 /// Base tools always included in every agent's whitelist.
@@ -37,37 +38,54 @@ const MEMORY_TOOLS: &[&str] = &["recall", "remember", "memory", "forget"];
 /// Task delegation tools.
 const TASK_TOOLS: &[&str] = &["delegate"];
 
+/// Per-conversation working directory overrides (shared with OS tool handlers).
+pub type ConversationCwds = Arc<tokio::sync::Mutex<std::collections::HashMap<u64, PathBuf>>>;
+
+/// Pending ask_user oneshots (shared with ask_user handler and protocol layer).
+pub type PendingAsks =
+    Arc<tokio::sync::Mutex<std::collections::HashMap<u64, tokio::sync::oneshot::Sender<String>>>>;
+
 pub struct Env<H: Host, S: Storage> {
     pub(crate) storage: Arc<S>,
-    pub(crate) memory: Option<Memory<S>>,
     pub(crate) cwd: PathBuf,
-    pub(crate) scopes: RwLock<BTreeMap<String, AgentScope>>,
+    pub scopes: Arc<RwLock<BTreeMap<String, AgentScope>>>,
     pub(crate) agent_descriptions: RwLock<BTreeMap<String, String>>,
+    /// Per-conversation CWD overrides.
+    pub conversation_cwds: ConversationCwds,
+    /// Pending ask_user replies.
+    pub pending_asks: PendingAsks,
     /// Host providing server-specific functionality.
     pub host: H,
+    /// Registered tools — schema + handler + optional lifecycle hooks.
+    entries: BTreeMap<String, ToolEntry>,
 }
 
 impl<H: Host, S: Storage> Env<H, S> {
     /// Create a new Env with the given backends.
-    pub fn new(storage: Arc<S>, cwd: PathBuf, memory: Option<Memory<S>>, host: H) -> Self {
+    pub fn new(
+        storage: Arc<S>,
+        cwd: PathBuf,
+        host: H,
+        scopes: Arc<RwLock<BTreeMap<String, AgentScope>>>,
+        conversation_cwds: ConversationCwds,
+        pending_asks: PendingAsks,
+    ) -> Self {
         Self {
             storage,
-            memory,
             cwd,
-            scopes: RwLock::new(BTreeMap::new()),
+            scopes,
             agent_descriptions: RwLock::new(BTreeMap::new()),
+            conversation_cwds,
+            pending_asks,
             host,
+            entries: BTreeMap::new(),
         }
     }
 
-    /// Access memory.
-    pub fn memory(&self) -> Option<&Memory<S>> {
-        self.memory.as_ref()
-    }
-
-    /// List connected MCP servers with their tool names.
-    pub fn mcp_servers(&self) -> Vec<(String, Vec<String>)> {
-        self.host.mcp_servers()
+    /// Register a tool with schema, handler, and optional lifecycle hooks.
+    pub fn register_tool(&mut self, entry: ToolEntry) {
+        let name = entry.schema.function.name.clone();
+        self.entries.insert(name, entry);
     }
 
     /// Register an agent's scope for dispatch enforcement.
@@ -110,7 +128,7 @@ impl<H: Host, S: Storage> Env<H, S> {
         }
 
         let mut whitelist: Vec<String> = BASE_TOOLS.iter().map(|&s| s.to_owned()).collect();
-        if self.memory.is_some() {
+        if MEMORY_TOOLS.iter().any(|&t| self.entries.contains_key(t)) {
             for &t in MEMORY_TOOLS {
                 whitelist.push(t.to_owned());
             }
@@ -190,44 +208,6 @@ impl<H: Host, S: Storage> Env<H, S> {
         }
     }
 
-    /// Validate member scope and delegate to the bridge.
-    async fn dispatch_delegate(&self, args: &str, agent: &str) -> Result<String, String> {
-        let input: crate::task::Delegate =
-            serde_json::from_str(args).map_err(|e| format!("invalid arguments: {e}"))?;
-        if input.tasks.is_empty() {
-            return Err("no tasks provided".to_owned());
-        }
-        {
-            let scopes = self.scopes.read().expect("scopes lock poisoned");
-            if let Some(scope) = scopes.get(agent)
-                && !scope.members.is_empty()
-            {
-                for task in &input.tasks {
-                    if !scope.members.iter().any(|m| m == &task.agent) {
-                        return Err(format!(
-                            "agent '{}' is not in your members list",
-                            task.agent
-                        ));
-                    }
-                }
-            }
-        }
-        self.host.dispatch_delegate(args, agent).await
-    }
-
-    /// Dispatch the `mcp` tool — extract scope, delegate to Host.
-    async fn dispatch_mcp(&self, args: &str, agent: &str) -> Result<String, String> {
-        let allowed_mcps: Vec<String> = self
-            .scopes
-            .read()
-            .expect("scopes lock poisoned")
-            .get(agent)
-            .filter(|s| !s.mcps.is_empty())
-            .map(|s| s.mcps.clone())
-            .unwrap_or_default();
-        self.host.dispatch_mcp(args, &allowed_mcps).await
-    }
-
     /// Route a tool call by name to the appropriate handler.
     pub async fn dispatch_tool(
         &self,
@@ -247,87 +227,28 @@ impl<H: Host, S: Storage> Env<H, S> {
                 return Err(format!("tool not available: {name}"));
             }
         }
-        match name {
-            "mcp" => self.dispatch_mcp(args, agent).await,
-            "skill" => self.dispatch_skill(args, agent).await,
-            "bash" if sender.contains(':') => {
-                Err("bash is only available in the command line interface".to_owned())
-            }
-            "bash" => self.dispatch_bash(args, conversation_id).await,
-            "read" => self.dispatch_read(args, conversation_id).await,
-            "edit" => self.dispatch_edit(args, conversation_id).await,
-            "recall" => self.dispatch_recall(args).await,
-            "remember" => self.dispatch_remember(args).await,
-            "memory" => self.dispatch_memory(args).await,
-            "forget" => self.dispatch_forget(args).await,
-            "delegate" => self.dispatch_delegate(args, agent).await,
-            "ask_user" => self.host.dispatch_ask_user(args, conversation_id).await,
-            name => {
-                self.host
-                    .dispatch_custom_tool(name, args, agent, conversation_id)
-                    .await
-            }
-        }
+        let handler = self
+            .entries
+            .get(name)
+            .ok_or_else(|| format!("tool not registered: {name}"))
+            .map(|e| e.handler.clone())?;
+        handler(ToolDispatch {
+            args: args.to_owned(),
+            agent: agent.to_owned(),
+            sender: sender.to_owned(),
+            conversation_id,
+        })
+        .await
     }
 }
 
 impl<H: Host + 'static, S: Storage> Hook for Env<H, S> {
     fn on_build_agent(&self, mut config: AgentConfig) -> AgentConfig {
-        config.system_prompt.push_str(&os::environment_block());
-
-        if let Some(ref mem) = self.memory {
-            let prompt = mem.build_prompt();
-            if !prompt.is_empty() {
-                config.system_prompt.push_str(&prompt);
+        // Append tool-provided system prompts.
+        for entry in self.entries.values() {
+            if let Some(ref prompt) = entry.system_prompt {
+                config.system_prompt.push_str(prompt);
             }
-        }
-
-        let mut hints = Vec::new();
-        let mcp_servers = self.host.mcp_servers();
-        if !mcp_servers.is_empty() {
-            let names: Vec<&str> = mcp_servers.iter().map(|(n, _)| n.as_str()).collect();
-            hints.push(format!(
-                "MCP servers: {}. Use the mcp tool to list or call tools.",
-                names.join(", ")
-            ));
-        }
-
-        // List visible skills from storage.
-        if let Ok(all_skills) = self.storage.list_skills() {
-            let visible: Vec<&wcore::repos::Skill> = if config.skills.is_empty() {
-                all_skills.iter().collect()
-            } else {
-                all_skills
-                    .iter()
-                    .filter(|s| config.skills.iter().any(|n| n == &s.name))
-                    .collect()
-            };
-            if !visible.is_empty() {
-                let lines: Vec<String> = visible
-                    .iter()
-                    .map(|s| {
-                        if s.description.is_empty() {
-                            format!("- {}", s.name)
-                        } else {
-                            format!("- {}: {}", s.name, s.description)
-                        }
-                    })
-                    .collect();
-                hints.push(format!(
-                    "Skills:\n\
-                     When a <skill> tag appears in a message, it has been pre-loaded by the system. \
-                     Follow its instructions directly — do not announce or re-load it.\n\
-                     Use the skill tool to discover available skills or load one by name.\n{}",
-                    lines.join("\n")
-                ));
-            }
-        }
-
-        if !hints.is_empty() {
-            config.system_prompt.push_str(&format!(
-                "\n\n<resources>\n{}\n</resources>",
-                hints.join("\n")
-            ));
         }
 
         self.apply_scope(&mut config);
@@ -344,7 +265,9 @@ impl<H: Host + 'static, S: Storage> Hook for Env<H, S> {
         conversation_id: u64,
         history: &[HistoryEntry],
     ) -> Vec<HistoryEntry> {
-        let mut entries = Vec::new();
+        let mut injected = Vec::new();
+
+        // Agent member descriptions (delegate coordination).
         let has_members = self
             .scopes
             .read()
@@ -362,31 +285,43 @@ impl<H: Host + 'static, S: Storage> Hook for Env<H, S> {
                     block.push_str(&format!("- {name}: {desc}\n"));
                 }
                 block.push_str("</agents>");
-                entries.push(HistoryEntry::user(block).auto_injected());
+                injected.push(HistoryEntry::user(block).auto_injected());
             }
         }
-        if let Some(ref mem) = self.memory {
-            entries.extend(mem.before_run(history));
+
+        // Tool-provided before_run hooks.
+        for entry in self.entries.values() {
+            if let Some(ref hook) = entry.before_run {
+                injected.extend(hook(history));
+            }
         }
+
+        // Working directory.
         let cwd = self
-            .host
-            .conversation_cwd(conversation_id)
+            .conversation_cwds
+            .try_lock()
+            .ok()
+            .and_then(|m| m.get(&conversation_id).cloned())
             .unwrap_or_else(|| self.cwd.clone());
-        entries.push(
+        injected.push(
             HistoryEntry::user(format!(
                 "<environment>\nworking_directory: {}\n</environment>",
                 cwd.display()
             ))
             .auto_injected(),
         );
+
+        // Layered instructions (Crab.md).
         if let Some(instructions) = self.host.discover_instructions(&cwd) {
-            entries.push(
+            injected.push(
                 HistoryEntry::user(format!("<instructions>\n{instructions}\n</instructions>"))
                     .auto_injected(),
             );
         }
+
+        // Guest agent framing.
         if history.iter().any(|e| !e.agent.is_empty()) {
-            entries.push(
+            injected.push(
                 HistoryEntry::user(
                     "Messages wrapped in <from agent=\"...\"> tags are from guest agents \
                      who were consulted in this conversation. Continue responding as yourself."
@@ -395,24 +330,7 @@ impl<H: Host + 'static, S: Storage> Hook for Env<H, S> {
                 .auto_injected(),
             );
         }
-        entries
-    }
-
-    async fn on_register_tools(&self, tools: &mut wcore::ToolRegistry) {
-        // MCP tool schemas from the host (daemon provides these).
-        let mcp_tools = self.host.mcp_tools();
-        if !mcp_tools.is_empty() {
-            tools.insert_all(mcp_tools);
-        }
-        tools.insert_all(os::tool::tools());
-        tools.insert_all(os::read::tools());
-        tools.insert_all(os::edit::tools());
-        tools.insert_all(skill::tool::tools());
-        tools.insert_all(crate::task::tools());
-        tools.insert_all(crate::ask_user::tools());
-        if self.memory.is_some() {
-            tools.insert_all(crate::memory::tool::tools());
-        }
+        injected
     }
 
     fn on_event(&self, agent: &str, conversation_id: u64, event: &AgentEvent) {
