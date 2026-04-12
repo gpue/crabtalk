@@ -1,18 +1,21 @@
 //! Tests for Runtime — agent registry, conversation management, and execution.
 //!
-//! Uses [`TestHook`] and [`TestProvider`] with InMemoryStorage. Every
-//! test gets its own in-memory storage — no shared global state, no
-//! filesystem I/O, no node.
+//! Uses `Env<()>` with InMemoryStorage. Every test gets its own
+//! in-memory storage — no shared global state, no filesystem I/O, no node.
 
-use crabtalk_runtime::Runtime;
+use crabtalk_runtime::{Config, Env, Runtime};
 use futures_util::StreamExt;
-use std::sync::Arc;
+use std::{
+    collections::BTreeMap,
+    path::PathBuf,
+    sync::{Arc, RwLock},
+};
 use wcore::{
-    AgentConfig, AgentEvent, AgentStopReason, Config,
+    AgentConfig, AgentEvent, AgentStopReason,
     model::Model,
-    test_utils::{
-        InMemoryStorage, TestHook,
-        test_provider::{TestProvider, text_chunks},
+    testing::{
+        InMemoryStorage,
+        provider::{TestProvider, text_chunks},
     },
 };
 
@@ -21,15 +24,20 @@ struct TestCfg;
 impl Config for TestCfg {
     type Storage = InMemoryStorage;
     type Provider = TestProvider;
-    type Hook = TestHook;
+    type Host = ();
 }
 
 /// Build a `Runtime` from a `TestProvider`.
 fn runtime(provider: TestProvider) -> Runtime<TestCfg> {
     let storage = Arc::new(InMemoryStorage::new());
+    let cwd = PathBuf::from("/test");
+    let scopes = Arc::new(RwLock::new(BTreeMap::new()));
+    let cwds = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+    let asks = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+    let env = Env::new(cwd, (), scopes, cwds, asks);
     Runtime::new(
         Model::new(provider),
-        TestHook::default(),
+        env,
         storage,
         wcore::ToolRegistry::new(),
     )

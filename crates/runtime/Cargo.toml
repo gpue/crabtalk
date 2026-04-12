@@ -15,6 +15,7 @@ wcore.workspace = true
 crabllm-core.workspace = true
 
 # crates.io
+chrono.workspace = true
 anyhow.workspace = true
 async-stream.workspace = true
 futures-core.workspace = true
@@ -24,4 +25,4 @@ tracing.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
-wcore = { workspace = true, features = ["test-utils"] }
+wcore = { workspace = true, features = ["testing"] }

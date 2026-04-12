@@ -6,6 +6,7 @@
 //! (`send_to`, `stream_to`) take a conversation ID, lock the conversation,
 //! clone the agent, and run with the conversation's history.
 
+use crate::{Config, Conversation, Env, Hook};
 use anyhow::{Result, bail};
 use async_stream::stream;
 use crabllm_core::{ChatCompletionRequest, Message, Role, ToolChoice};
@@ -20,16 +21,16 @@ use std::{
 };
 use tokio::sync::{Mutex, RwLock, mpsc, watch};
 use wcore::{
-    Agent, AgentBuilder, AgentConfig, AgentEvent, AgentResponse, AgentStopReason, Config,
-    Conversation, Hook, ToolDispatcher, ToolRegistry,
+    Agent, AgentBuilder, AgentConfig, AgentEvent, AgentResponse, AgentStopReason, ToolDispatcher,
+    ToolRegistry,
     model::{HistoryEntry, Model},
-    repos::{SessionHandle, Storage},
+    storage::{SessionHandle, Storage},
 };
 
 /// The crabtalk runtime.
 pub struct Runtime<C: Config> {
     pub model: Model<C::Provider>,
-    pub hook: Arc<C::Hook>,
+    pub hook: Arc<Env<C::Host>>,
     storage: Arc<C::Storage>,
     agents: StdRwLock<BTreeMap<String, Agent<C::Provider>>>,
     ephemeral_agents: RwLock<BTreeMap<String, Agent<C::Provider>>>,
@@ -40,15 +41,10 @@ pub struct Runtime<C: Config> {
 }
 
 impl<C: Config> Runtime<C> {
-    /// Create a new runtime with the given model, hook, storage, and tools.
-    ///
-    /// Tool schemas and handlers are registered on the hook before
-    /// construction — see [`Env::register_tool`](crate::Env::register_tool).
-    /// The hook doubles as the [`ToolDispatcher`] for every agent built
-    /// by this runtime.
+    /// Create a new runtime with the given model, env, storage, and tools.
     pub fn new(
         model: Model<C::Provider>,
-        hook: C::Hook,
+        hook: Env<C::Host>,
         storage: Arc<C::Storage>,
         tools: ToolRegistry,
     ) -> Self {
@@ -466,7 +462,10 @@ impl<C: Config> Runtime<C> {
         content: &str,
         sender: &str,
     ) -> String {
-        let content = self.hook.preprocess(&conversation.agent, content);
+        let content = self
+            .hook
+            .preprocess(&conversation.agent, content)
+            .unwrap_or_else(|| content.to_owned());
         if sender.is_empty() {
             conversation.history.push(HistoryEntry::user(&content));
         } else {
@@ -643,7 +642,10 @@ impl<C: Config> Runtime<C> {
             let mut conversation = conversation_mutex.lock().await;
             let pre_run_len = conversation.history.len();
 
-            let content = self.hook.preprocess(&conversation.agent, &content);
+            let content = self
+                .hook
+                .preprocess(&conversation.agent, &content)
+                .unwrap_or_else(|| content.clone());
             if sender.is_empty() {
                 conversation.history.push(HistoryEntry::user(&content));
             } else {

@@ -1,43 +1,41 @@
 //! Node — the core struct composing runtime, transports, and lifecycle.
 
-use crate::{
-    NodeConfig,
-    cron::CronStore,
-    event_bus::EventBus,
-    hook::host::NodeHost,
-    node::builder::{BuildProvider, DefaultProvider, build_default_provider},
-    storage::FsStorage,
-};
+use crate::{NodeConfig, storage::FsStorage};
 use anyhow::Result;
 use crabllm_core::Provider;
 use futures_util::{StreamExt, pin_mut};
-use runtime::{Env, Runtime, host::Host};
+use runtime::{Runtime, host::Host};
 use std::{
     marker::PhantomData,
     path::{Path, PathBuf},
     sync::Arc,
 };
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc, oneshot};
-// NOTE: EventBus uses std::sync::Mutex so it can be locked from
-// synchronous lifecycle hooks (Env::on_event). Protocol-facing
-// subscribe/unsubscribe/list paths use this same mutex.
 use wcore::{
     model::Model,
     protocol::{api::Server, message::ClientMessage},
 };
+use {
+    builder::{BuildProvider, DefaultProvider, build_default_provider},
+    cron::CronStore,
+    event::EventBus,
+    host::NodeHost,
+};
 
-pub(crate) mod builder;
-mod protocol;
+pub mod builder;
+pub mod cron;
+pub mod event;
+pub mod host;
 
 /// Config binding for a node: ties Provider + Host to FsStorage + Env.
 pub struct NodeCfg<P: Provider + 'static = DefaultProvider, B: Host + 'static = NodeHost> {
     _marker: PhantomData<(P, B)>,
 }
 
-impl<P: Provider + 'static, B: Host + 'static> wcore::Config for NodeCfg<P, B> {
+impl<P: Provider + 'static, B: Host + 'static> runtime::Config for NodeCfg<P, B> {
     type Storage = FsStorage;
     type Provider = P;
-    type Hook = Env<B, FsStorage>;
+    type Host = B;
 }
 
 /// Shared runtime handle — `Arc<RwLock<Arc<...>>>` so reload can swap

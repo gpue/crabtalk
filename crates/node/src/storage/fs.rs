@@ -14,7 +14,9 @@ use std::{
 use wcore::{
     AgentConfig, AgentId, ArchiveSegment, ConversationMeta, EventLine, ManifestConfig, NodeConfig,
     model::HistoryEntry,
-    repos::{MemoryEntry, SessionHandle, SessionSnapshot, SessionSummary, Skill, Storage, slugify},
+    storage::{
+        MemoryEntry, SessionHandle, SessionSnapshot, SessionSummary, Skill, Storage, slugify,
+    },
 };
 
 use super::atomic_write;
@@ -242,7 +244,7 @@ impl Storage for FsStorage {
                         continue;
                     }
                 };
-                match tools::skill::loader::parse_skill_md(&content) {
+                match crate::hooks::skill::loader::parse_skill_md(&content) {
                     Ok(skill) => {
                         seen.insert(name);
                         skills.push(skill);
@@ -261,7 +263,7 @@ impl Storage for FsStorage {
                 continue;
             }
             let content = fs::read_to_string(&skill_path)?;
-            let skill = tools::skill::loader::parse_skill_md(&content)?;
+            let skill = crate::hooks::skill::loader::parse_skill_md(&content)?;
             return Ok(Some(skill));
         }
         Ok(None)

@@ -1,18 +1,18 @@
 //! Env — the embeddable engine environment.
 //!
-//! [`Env`] implements `wcore::Hook` and provides the central `dispatch_tool`
-//! entry point. Tool handlers are registered dynamically at startup — there
-//! is no hardcoded dispatch table.
+//! [`Env`] orchestrates registered [`Hook`] implementations (tools and
+//! subsystems) and provides scope enforcement for dispatch. Tool
+//! handlers are registered dynamically at startup via `register_hook`.
 
-use crate::host::Host;
+use crate::{Hook, host::Host};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     path::PathBuf,
     sync::{Arc, RwLock},
 };
+use tokio::sync::{Mutex, oneshot};
 use wcore::{
-    AgentConfig, AgentEvent, Hook, ToolDispatch, ToolDispatcher, ToolEntry, ToolFuture,
-    model::HistoryEntry, repos::Storage,
+    AgentConfig, AgentEvent, ToolDispatch, ToolDispatcher, ToolFuture, model::HistoryEntry,
 };
 
 /// Per-agent scope for dispatch enforcement. Empty vecs = unrestricted.
@@ -40,41 +40,35 @@ const MEMORY_TOOLS: &[&str] = &["recall", "remember", "memory", "forget"];
 const TASK_TOOLS: &[&str] = &["delegate"];
 
 /// Per-conversation working directory overrides (shared with OS tool handlers).
-pub type ConversationCwds = Arc<tokio::sync::Mutex<std::collections::HashMap<u64, PathBuf>>>;
+pub type ConversationCwds = Arc<Mutex<HashMap<u64, PathBuf>>>;
 
 /// Pending ask_user oneshots (shared with ask_user handler and protocol layer).
-pub type PendingAsks =
-    Arc<tokio::sync::Mutex<std::collections::HashMap<u64, tokio::sync::oneshot::Sender<String>>>>;
+pub type PendingAsks = Arc<Mutex<HashMap<u64, oneshot::Sender<String>>>>;
 
 /// Late-bindable sink for `agent:{name}:done` event publishes.
-///
-/// The node-level event bus lives outside wcore but wants to be
-/// notified when agents complete. Env stores a type-erased callable
-/// that the node installs after constructing its EventBus. `None`
-/// means no sink is wired up.
 pub type EventSink = Arc<dyn Fn(&str, &str) + Send + Sync>;
 
-pub struct Env<H: Host, S: Storage> {
-    pub(crate) storage: Arc<S>,
+pub struct Env<H: Host> {
     pub(crate) cwd: PathBuf,
     pub scopes: Arc<RwLock<BTreeMap<String, AgentScope>>>,
     pub(crate) agent_descriptions: RwLock<BTreeMap<String, String>>,
-    /// Per-conversation CWD overrides.
+    /// Per-conversation CWD overrides (shared with OsHook + DelegateHook).
     pub conversation_cwds: ConversationCwds,
-    /// Pending ask_user replies.
+    /// Pending ask_user replies (shared with AskUserHook).
     pub pending_asks: PendingAsks,
     /// Host providing server-specific functionality.
     pub host: H,
-    /// Registered tools — schema + handler + optional lifecycle hooks.
-    entries: BTreeMap<String, ToolEntry>,
+    /// Registered hooks keyed by subsystem name.
+    hooks: BTreeMap<String, Arc<dyn Hook>>,
+    /// Tool name → owning hook for O(log n) dispatch.
+    dispatch_map: BTreeMap<String, Arc<dyn Hook>>,
     /// Late-bound sink for publishing `agent:{name}:done` events.
     event_sink: RwLock<Option<EventSink>>,
 }
 
-impl<H: Host, S: Storage> Env<H, S> {
+impl<H: Host> Env<H> {
     /// Create a new Env with the given backends.
     pub fn new(
-        storage: Arc<S>,
         cwd: PathBuf,
         host: H,
         scopes: Arc<RwLock<BTreeMap<String, AgentScope>>>,
@@ -82,27 +76,32 @@ impl<H: Host, S: Storage> Env<H, S> {
         pending_asks: PendingAsks,
     ) -> Self {
         Self {
-            storage,
             cwd,
             scopes,
             agent_descriptions: RwLock::new(BTreeMap::new()),
             conversation_cwds,
             pending_asks,
             host,
-            entries: BTreeMap::new(),
+            hooks: BTreeMap::new(),
+            dispatch_map: BTreeMap::new(),
             event_sink: RwLock::new(None),
         }
     }
 
-    /// Register a tool with schema, handler, and optional lifecycle hooks.
-    pub fn register_tool(&mut self, entry: ToolEntry) {
-        let name = entry.schema.function.name.clone();
-        self.entries.insert(name, entry);
+    /// Register a hook (tool subsystem) by name.
+    ///
+    /// The hook's `schema()` is called to populate the dispatch map so
+    /// tool calls route to this hook in O(log n).
+    pub fn register_hook(&mut self, name: impl Into<String>, hook: Arc<dyn Hook>) {
+        for tool in hook.schema() {
+            self.dispatch_map
+                .insert(tool.function.name.clone(), hook.clone());
+        }
+        self.hooks.insert(name.into(), hook);
     }
 
     /// Install the late-bound [`EventSink`] used by `on_event` to publish
-    /// `agent:{name}:done` events. The node calls this once its event bus
-    /// has been constructed and wired to the shared runtime.
+    /// `agent:{name}:done` events.
     pub fn set_event_sink(&self, sink: EventSink) {
         *self.event_sink.write().expect("event_sink lock poisoned") = Some(sink);
     }
@@ -147,7 +146,10 @@ impl<H: Host, S: Storage> Env<H, S> {
         }
 
         let mut whitelist: Vec<String> = BASE_TOOLS.iter().map(|&s| s.to_owned()).collect();
-        if MEMORY_TOOLS.iter().any(|&t| self.entries.contains_key(t)) {
+        if MEMORY_TOOLS
+            .iter()
+            .any(|&t| self.dispatch_map.contains_key(t))
+        {
             for &t in MEMORY_TOOLS {
                 whitelist.push(t.to_owned());
             }
@@ -184,49 +186,6 @@ impl<H: Host, S: Storage> Env<H, S> {
         config.tools = whitelist;
     }
 
-    /// Resolve a leading `/skill-name` command at the start of the message.
-    fn resolve_slash_skill(&self, agent: &str, content: &str) -> String {
-        let trimmed = content.trim_start();
-        let Some(rest) = trimmed.strip_prefix('/') else {
-            return content.to_owned();
-        };
-
-        let end = rest
-            .find(|c: char| !c.is_ascii_lowercase() && !c.is_ascii_digit() && c != '-')
-            .unwrap_or(rest.len());
-        let name = &rest[..end];
-        let remainder = &rest[end..];
-
-        if name.is_empty() || name.contains("..") {
-            return content.to_owned();
-        }
-
-        // Enforce skill scope.
-        {
-            let scopes = self.scopes.read().expect("scopes lock poisoned");
-            if let Some(scope) = scopes.get(agent)
-                && !scope.skills.is_empty()
-                && !scope.skills.iter().any(|s| s == name)
-            {
-                return content.to_owned();
-            }
-        }
-
-        // Load via Storage.
-        match self.storage.load_skill(name) {
-            Ok(Some(skill)) => {
-                let body = remainder.trim_start();
-                let block = format!("<skill name=\"{name}\">\n{}\n</skill>", skill.body);
-                if body.is_empty() {
-                    block
-                } else {
-                    format!("{body}\n\n{block}")
-                }
-            }
-            _ => content.to_owned(),
-        }
-    }
-
     /// Route a tool call by name to the appropriate handler.
     pub async fn dispatch_tool(
         &self,
@@ -236,7 +195,7 @@ impl<H: Host, S: Storage> Env<H, S> {
         sender: &str,
         conversation_id: Option<u64>,
     ) -> Result<String, String> {
-        // Dispatch enforcement: reject tools not in the agent's whitelist.
+        // Scope enforcement: reject tools not in the agent's whitelist.
         {
             let scopes = self.scopes.read().expect("scopes lock poisoned");
             if let Some(scope) = scopes.get(agent)
@@ -246,22 +205,25 @@ impl<H: Host, S: Storage> Env<H, S> {
                 return Err(format!("tool not available: {name}"));
             }
         }
-        let handler = self
-            .entries
-            .get(name)
-            .ok_or_else(|| format!("tool not registered: {name}"))
-            .map(|e| e.handler.clone())?;
-        handler(ToolDispatch {
+
+        let call = ToolDispatch {
             args: args.to_owned(),
             agent: agent.to_owned(),
             sender: sender.to_owned(),
             conversation_id,
-        })
-        .await
+        };
+
+        if let Some(hook) = self.dispatch_map.get(name)
+            && let Some(fut) = hook.dispatch(name, call)
+        {
+            return fut.await;
+        }
+
+        Err(format!("tool not registered: {name}"))
     }
 }
 
-impl<H: Host + 'static, S: Storage + 'static> ToolDispatcher for Env<H, S> {
+impl<H: Host + 'static> ToolDispatcher for Env<H> {
     fn dispatch<'a>(
         &'a self,
         name: &'a str,
@@ -274,21 +236,24 @@ impl<H: Host + 'static, S: Storage + 'static> ToolDispatcher for Env<H, S> {
     }
 }
 
-impl<H: Host + 'static, S: Storage> Hook for Env<H, S> {
+impl<H: Host + 'static> Hook for Env<H> {
     fn on_build_agent(&self, mut config: AgentConfig) -> AgentConfig {
-        // Append tool-provided system prompts.
-        for entry in self.entries.values() {
-            if let Some(ref prompt) = entry.system_prompt {
+        for hook in self.hooks.values() {
+            if let Some(ref prompt) = hook.system_prompt() {
                 config.system_prompt.push_str(prompt);
             }
         }
-
         self.apply_scope(&mut config);
         config
     }
 
-    fn preprocess(&self, agent: &str, content: &str) -> String {
-        self.resolve_slash_skill(agent, content)
+    fn preprocess(&self, agent: &str, content: &str) -> Option<String> {
+        for hook in self.hooks.values() {
+            if let Some(result) = hook.preprocess(agent, content) {
+                return Some(result);
+            }
+        }
+        None
     }
 
     fn on_before_run(
@@ -321,29 +286,18 @@ impl<H: Host + 'static, S: Storage> Hook for Env<H, S> {
             }
         }
 
-        // Tool-provided before_run hooks.
-        for entry in self.entries.values() {
-            if let Some(ref hook) = entry.before_run {
-                injected.extend(hook(history));
-            }
+        // Hook-provided before_run.
+        for hook in self.hooks.values() {
+            injected.extend(hook.on_before_run(agent, conversation_id, history));
         }
 
-        // Working directory.
+        // Layered instructions (Crab.md).
         let cwd = self
             .conversation_cwds
             .try_lock()
             .ok()
             .and_then(|m| m.get(&conversation_id).cloned())
             .unwrap_or_else(|| self.cwd.clone());
-        injected.push(
-            HistoryEntry::user(format!(
-                "<environment>\nworking_directory: {}\n</environment>",
-                cwd.display()
-            ))
-            .auto_injected(),
-        );
-
-        // Layered instructions (Crab.md).
         if let Some(instructions) = self.host.discover_instructions(&cwd) {
             injected.push(
                 HistoryEntry::user(format!("<instructions>\n{instructions}\n</instructions>"))
@@ -366,9 +320,12 @@ impl<H: Host + 'static, S: Storage> Hook for Env<H, S> {
     }
 
     fn on_event(&self, agent: &str, conversation_id: u64, event: &AgentEvent) {
+        for hook in self.hooks.values() {
+            hook.on_event(agent, conversation_id, event);
+        }
+
         self.host.on_agent_event(agent, conversation_id, event);
 
-        // Fan out agent completion to the node event bus (if installed).
         if let AgentEvent::Done(response) = event
             && let Some(sink) = self
                 .event_sink

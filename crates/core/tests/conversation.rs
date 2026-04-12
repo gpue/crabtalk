@@ -2,9 +2,9 @@
 
 use crabtalk_core::{
     model::HistoryEntry,
-    repos::{SessionHandle, Storage},
     sender_slug,
-    test_utils::InMemoryStorage,
+    storage::{SessionHandle, Storage},
+    testing::InMemoryStorage,
 };
 
 fn storage() -> InMemoryStorage {
