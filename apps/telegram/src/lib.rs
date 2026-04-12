@@ -1,12 +1,12 @@
 //! Crabtalk Telegram gateway — Telegram Bot API adapter.
 
 pub mod command;
+pub mod config;
 pub mod markdown;
 pub mod serve;
 
-pub use gateway::*;
-
 use futures_util::StreamExt;
+pub use sdk::*;
 use teloxide::prelude::*;
 use teloxide::types::{CallbackQuery, ChatKind, UpdateKind};
 use teloxide::update_listeners::{AsUpdateStream, polling_default};

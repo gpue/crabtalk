@@ -11,19 +11,20 @@ repository = "https://github.com/crabtalk/crabtalk"
 keywords = ["llm", "agent", "ai"]
 
 [workspace.dependencies]
-crabtalk-plugins = { path = "crates/plugins", version = "0.0.20" }
-crabtalk-telegram = { path = "apps/telegram", version = "0.0.20" }
-crabtalk-wechat = { path = "apps/wechat", version = "0.0.20" }
-gateway = { path = "crates/gateway", package = "crabtalk-gateway", version = "0.0.20" }
-cli = { path = "crates/cli", package = "crabtalk", version = "0.0.20" }
-node = { path = "crates/node", package = "crabtalk-node", version = "0.0.20" }
+plugin = { path = "plugins/plugins", package = "crabtalk-plugins", version = "0.0.20" }
+telegram = { path = "apps/telegram", package = "crabtalk-telegram", version = "0.0.20" }
+wechat = { path = "apps/wechat", package = "crabtalk-wechat", version = "0.0.20" }
+sdk = { path = "apps/sdk", package = "crabtalk-sdk", version = "0.0.20" }
+tui = { path = "apps/tui", package = "crabtalk-tui", version = "0.0.20" }
+crabtalk = { path = "crates/crabtalk", package = "crabtalk", version = "0.0.20", default-features = false }
+crabtalkd = { path = "apps/daemon", package = "crabtalkd", version = "0.0.20" }
 runtime = { path = "crates/runtime", package = "crabtalk-runtime", version = "0.0.20" }
 transport = { path = "crates/transport", package = "crabtalk-transport", version = "0.0.20" }
 wcore = { path = "crates/core", package = "crabtalk-core", version = "0.0.20" }
-crabtalk-command = { path = "crates/command", version = "0.0.20" }
-crabtalk-command-codegen = { path = "crates/command-codegen", version = "0.0.20" }
-woutlook = { path = "plugins/outlook", package = "crabtalk-outlook", version = "0.0.20", default-features = false }
-wsearch = { path = "plugins/search", package = "crabtalk-search", version = "0.0.20", default-features = false }
+command = { path = "plugins/command", package = "crabtalk-command", version = "0.0.20" }
+command-codegen = { path = "plugins/command-codegen", package = "crabtalk-command-codegen", version = "0.0.20" }
+outlook = { path = "plugins/outlook", package = "crabtalk-outlook", version = "0.0.20", default-features = false }
+search = { path = "plugins/search", package = "crabtalk-search", version = "0.0.20", default-features = false }
 
 # crabllm
 crabllm-core = "0.0.15"
@@ -63,7 +64,7 @@ reqwest = { version = "0.13", default-features = false, features = [
     "json",
     "query",
     "stream",
-    "rustls-no-provider",
+    "native-tls",
 ] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rmcp = { version = "1.3", default-features = false }

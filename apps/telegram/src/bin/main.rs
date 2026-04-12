@@ -9,12 +9,12 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode},
 };
 
-#[crabtalk_command::command(kind = "client", name = "telegram")]
+#[command::command(kind = "client", name = "telegram")]
 struct GatewayTelegram;
 
 impl GatewayTelegram {
     async fn run(&self) -> anyhow::Result<()> {
-        let client = gateway::NodeClient::platform_default()?;
+        let client = sdk::NodeClient::platform_default()?;
         let config_path = config_path();
         let config = TelegramConfig::load(&config_path)?;
         crabtalk_telegram::serve::run(client, &config).await
@@ -93,8 +93,8 @@ fn ensure_config() -> anyhow::Result<()> {
 
 fn main() {
     // Migrate: remove old gateway-prefixed service if present.
-    if crabtalk_command::is_installed("ai.crabtalk.gateway-telegram") {
-        let _ = crabtalk_command::uninstall("ai.crabtalk.gateway-telegram");
+    if command::is_installed("ai.crabtalk.gateway-telegram") {
+        let _ = command::uninstall("ai.crabtalk.gateway-telegram");
     }
 
     let cli = CrabtalkCli::parse();
