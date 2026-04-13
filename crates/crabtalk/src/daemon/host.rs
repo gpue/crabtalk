@@ -1,16 +1,16 @@
-//! NodeHost — server-specific Host implementation and NodeEnv type alias.
+//! DaemonEnv — server-specific Host implementation and DaemonEnv type alias.
 
-use runtime::host::Host;
-use std::path::Path;
+use crate::daemon::{ConversationCwds, hook::DaemonHook};
+use runtime::Env;
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 use tokio::sync::broadcast;
 use wcore::{
     AgentEvent,
     protocol::message::{AgentEventKind, AgentEventMsg, ToolCallInfo},
 };
-
-/// The daemon's environment type — Env with NodeHost for
-/// server-specific dispatch.
-pub type NodeEnv = runtime::Env<NodeHost>;
 
 /// Tool result output is truncated to this many bytes in the broadcast.
 const MAX_TOOL_OUTPUT_BROADCAST: usize = 2048;
@@ -18,12 +18,24 @@ const MAX_TOOL_OUTPUT_BROADCAST: usize = 2048;
 /// Server-specific host for the daemon — event broadcasting and
 /// instruction discovery.
 #[derive(Clone)]
-pub struct NodeHost {
+pub struct DaemonEnv {
     /// Broadcast channel for agent events (console subscription).
     pub(crate) events_tx: broadcast::Sender<AgentEventMsg>,
+    /// Base working directory.
+    pub(crate) cwd: PathBuf,
+    /// Per-conversation CWD overrides (shared with DaemonHook + OsHook + DelegateHook).
+    pub(crate) conversation_cwds: ConversationCwds,
+    /// Composite hook owning all sub-hooks and shared state.
+    pub(crate) hook: Arc<DaemonHook>,
 }
 
-impl Host for NodeHost {
+impl Env for DaemonEnv {
+    type Hook = DaemonHook;
+
+    fn hook(&self) -> &DaemonHook {
+        &self.hook
+    }
+
     fn on_agent_event(&self, agent: &str, conversation_id: u64, event: &AgentEvent) {
         struct Payload {
             kind: AgentEventKind,
@@ -142,6 +154,28 @@ impl Host for NodeHost {
 
     fn discover_instructions(&self, cwd: &Path) -> Option<String> {
         discover_instructions(cwd)
+    }
+
+    fn effective_cwd(&self, conversation_id: u64) -> PathBuf {
+        if let Ok(map) = self.conversation_cwds.try_lock()
+            && let Some(cwd) = map.get(&conversation_id)
+        {
+            return cwd.clone();
+        }
+        self.cwd.clone()
+    }
+}
+
+impl wcore::ToolDispatcher for DaemonEnv {
+    fn dispatch<'a>(
+        &'a self,
+        name: &'a str,
+        args: &'a str,
+        agent: &'a str,
+        sender: &'a str,
+        conversation_id: Option<u64>,
+    ) -> wcore::ToolFuture<'a> {
+        runtime::env::dispatch_tool(self, name, args, agent, sender, conversation_id)
     }
 }
 

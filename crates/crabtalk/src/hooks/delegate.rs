@@ -1,8 +1,10 @@
 //! Delegate tool — as a Hook implementation.
 
-use crate::node::SharedRuntime;
+use crate::daemon::ConversationCwds;
+use crate::daemon::hook::AgentScope;
+use crate::{daemon::SharedRuntime, hooks::os::ReadFiles};
 use crabllm_core::Provider;
-use runtime::{AgentScope, ConversationCwds, Hook, host::Host};
+use runtime::Hook;
 use serde::Deserialize;
 use std::{
     collections::BTreeMap,
@@ -49,29 +51,45 @@ impl ToolDescription for Delegate {
 ///
 /// Owns scopes for member enforcement, a late-bind runtime handle, and
 /// the shared conversation CWD map for child task CWD overrides.
-pub struct DelegateHook<P: Provider + 'static, H: Host + 'static> {
+pub struct DelegateHook<P: Provider + 'static> {
     scopes: Arc<RwLock<BTreeMap<String, AgentScope>>>,
-    runtime: Arc<OnceLock<SharedRuntime<P, H>>>,
+    runtime: Arc<OnceLock<SharedRuntime<P>>>,
     conversation_cwds: ConversationCwds,
+    read_files: ReadFiles,
 }
 
-impl<P: Provider + 'static, H: Host + 'static> DelegateHook<P, H> {
+impl<P: Provider + 'static> DelegateHook<P> {
     pub fn new(
         scopes: Arc<RwLock<BTreeMap<String, AgentScope>>>,
-        runtime: Arc<OnceLock<SharedRuntime<P, H>>>,
+        runtime: Arc<OnceLock<SharedRuntime<P>>>,
         conversation_cwds: ConversationCwds,
+        read_files: ReadFiles,
     ) -> Self {
         Self {
             scopes,
             runtime,
             conversation_cwds,
+            read_files,
         }
     }
 }
 
-impl<P: Provider + 'static, H: Host + 'static> Hook for DelegateHook<P, H> {
+impl<P: Provider + 'static> Hook for DelegateHook<P> {
     fn schema(&self) -> Vec<wcore::model::Tool> {
         vec![Delegate::as_tool()]
+    }
+
+    fn scoped_tools(&self, config: &wcore::AgentConfig) -> (Vec<String>, Option<String>) {
+        if config.members.is_empty() {
+            return (vec![], None);
+        }
+        let tools = self
+            .schema()
+            .iter()
+            .map(|t| t.function.name.clone())
+            .collect();
+        let line = format!("members: {}", config.members.join(", "));
+        (tools, Some(line))
     }
 
     fn dispatch<'a>(&'a self, name: &'a str, call: ToolDispatch) -> Option<ToolFuture<'a>> {
@@ -103,15 +121,16 @@ impl<P: Provider + 'static, H: Host + 'static> Hook for DelegateHook<P, H> {
                 .runtime
                 .get()
                 .ok_or_else(|| "delegate: runtime not initialized".to_owned())?;
-            dispatch_delegate(input, shared, &self.conversation_cwds).await
+            dispatch_delegate(input, shared, &self.conversation_cwds, &self.read_files).await
         }))
     }
 }
 
-async fn dispatch_delegate<P: Provider + 'static, H: Host + 'static>(
+async fn dispatch_delegate<P: Provider + 'static>(
     input: Delegate,
-    shared: &SharedRuntime<P, H>,
+    shared: &SharedRuntime<P>,
     conversation_cwds: &ConversationCwds,
+    read_files: &ReadFiles,
 ) -> Result<String, String> {
     let mut ephemeral_names = Vec::new();
     let mut tasks = Vec::with_capacity(input.tasks.len());
@@ -136,6 +155,7 @@ async fn dispatch_delegate<P: Provider + 'static, H: Host + 'static>(
         let handle = spawn_agent_task(
             shared.clone(),
             conversation_cwds.clone(),
+            read_files.clone(),
             agent_name.clone(),
             task.message,
             task.cwd,
@@ -202,9 +222,10 @@ fn ephemeral_agent_name() -> String {
     format!("_ephemeral:{id}")
 }
 
-fn spawn_agent_task<P: Provider + 'static, H: Host + 'static>(
-    shared: SharedRuntime<P, H>,
+fn spawn_agent_task<P: Provider + 'static>(
+    shared: SharedRuntime<P>,
     conversation_cwds: ConversationCwds,
+    read_files: ReadFiles,
     agent: String,
     message: String,
     cwd: Option<String>,
@@ -235,6 +256,10 @@ fn spawn_agent_task<P: Provider + 'static, H: Host + 'static>(
         };
 
         conversation_cwds.lock().await.remove(&conversation_id);
+        read_files
+            .lock()
+            .expect("read_files lock poisoned")
+            .remove(&conversation_id);
         rt.close_conversation(conversation_id).await;
 
         (result_content, error_msg)

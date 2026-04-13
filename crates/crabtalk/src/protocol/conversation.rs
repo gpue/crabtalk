@@ -1,16 +1,15 @@
 //! Conversation execution: send, stream, compact, kill, steer.
 
-use crate::node::Node;
+use crate::daemon::Daemon;
 use anyhow::Result;
 use crabllm_core::Provider;
 use futures_util::{StreamExt, pin_mut};
-use runtime::host::Host;
 use std::sync::Arc;
 use wcore::AgentEvent;
 use wcore::protocol::message::*;
 
-pub(super) async fn send<P: Provider + 'static, H: Host + 'static>(
-    node: &Node<P, H>,
+pub(super) async fn send<P: Provider + 'static>(
+    node: &Daemon<P>,
     req: SendMsg,
 ) -> Result<SendResponse> {
     let rt: Arc<_> = node.runtime.read().await.clone();
@@ -21,8 +20,8 @@ pub(super) async fn send<P: Provider + 'static, H: Host + 'static>(
         .get_or_create_conversation(&req.agent, created_by)
         .await?;
     if let Some(ref cwd) = cwd {
-        rt.hook
-            .conversation_cwds
+        node.os_hook
+            .conversation_cwds()
             .lock()
             .await
             .insert(conversation_id, cwd.clone());
@@ -43,11 +42,12 @@ pub(super) async fn send<P: Provider + 'static, H: Host + 'static>(
     })
 }
 
-pub(super) fn stream<'a, P: Provider + 'static, H: Host + 'static>(
-    node: &'a Node<P, H>,
+pub(super) fn stream<'a, P: Provider + 'static>(
+    node: &'a Daemon<P>,
     req: StreamMsg,
 ) -> impl futures_core::Stream<Item = Result<StreamEvent>> + Send + 'a {
     let runtime = node.runtime.clone();
+    let conversation_cwds = node.os_hook.conversation_cwds().clone();
     let agent = req.agent;
     let content = req.content;
     let sender = req.sender.unwrap_or_default();
@@ -61,7 +61,7 @@ pub(super) fn stream<'a, P: Provider + 'static, H: Host + 'static>(
         let created_by = if sender.is_empty() { "user".into() } else { sender.clone() };
         let conversation_id = rt.get_or_create_conversation(&agent, created_by.as_str()).await?;
         if let Some(ref cwd) = cwd {
-            rt.hook.conversation_cwds.lock().await.insert(conversation_id, cwd.clone());
+            conversation_cwds.lock().await.insert(conversation_id, cwd.clone());
         }
 
         let responding_agent = if guest.is_empty() { agent.clone() } else { guest.clone() };
@@ -172,8 +172,8 @@ pub(super) fn stream<'a, P: Provider + 'static, H: Host + 'static>(
     }
 }
 
-pub(super) async fn compact<P: Provider + 'static, H: Host + 'static>(
-    node: &Node<P, H>,
+pub(super) async fn compact<P: Provider + 'static>(
+    node: &Daemon<P>,
     agent: String,
     sender: String,
 ) -> Result<String> {
@@ -189,8 +189,8 @@ pub(super) async fn compact<P: Provider + 'static, H: Host + 'static>(
         .ok_or_else(|| anyhow::anyhow!("compact failed for agent='{agent}' sender='{sender}'"))
 }
 
-pub(super) async fn list_active<P: Provider + 'static, H: Host + 'static>(
-    node: &Node<P, H>,
+pub(super) async fn list_active<P: Provider + 'static>(
+    node: &Daemon<P>,
 ) -> Result<Vec<ActiveConversationInfo>> {
     let rt = node.runtime.read().await.clone();
     let conversations = rt.conversations().await;
@@ -208,8 +208,8 @@ pub(super) async fn list_active<P: Provider + 'static, H: Host + 'static>(
     Ok(infos)
 }
 
-pub(super) async fn kill<P: Provider + 'static, H: Host + 'static>(
-    node: &Node<P, H>,
+pub(super) async fn kill<P: Provider + 'static>(
+    node: &Daemon<P>,
     agent: String,
     sender: String,
 ) -> Result<bool> {
@@ -217,16 +217,16 @@ pub(super) async fn kill<P: Provider + 'static, H: Host + 'static>(
     let Some(conversation_id) = rt.find_conversation_id(&agent, &sender).await else {
         return Ok(false);
     };
-    rt.hook
-        .conversation_cwds
+    node.os_hook
+        .conversation_cwds()
         .lock()
         .await
         .remove(&conversation_id);
     Ok(rt.close_conversation(conversation_id).await)
 }
 
-pub(super) async fn reply_to_ask<P: Provider + 'static, H: Host + 'static>(
-    node: &Node<P, H>,
+pub(super) async fn reply_to_ask<P: Provider + 'static>(
+    node: &Daemon<P>,
     agent: String,
     sender: String,
     content: String,
@@ -238,22 +238,34 @@ pub(super) async fn reply_to_ask<P: Provider + 'static, H: Host + 'static>(
         .ok_or_else(|| {
             anyhow::anyhow!("conversation not found for agent='{agent}' sender='{sender}'")
         })?;
-    if let Some(tx) = rt.hook.pending_asks.lock().await.remove(&conversation_id) {
+    if let Some(tx) = node
+        .ask_hook
+        .pending_asks()
+        .lock()
+        .await
+        .remove(&conversation_id)
+    {
         let _ = tx.send(content);
         return Ok(());
     }
     // Retry once after a short delay — the ask_user handler may not have
     // inserted the oneshot yet if the reply races the tool call.
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    if let Some(tx) = rt.hook.pending_asks.lock().await.remove(&conversation_id) {
+    if let Some(tx) = node
+        .ask_hook
+        .pending_asks()
+        .lock()
+        .await
+        .remove(&conversation_id)
+    {
         let _ = tx.send(content);
         return Ok(());
     }
     anyhow::bail!("no pending ask_user for agent='{agent}' sender='{sender}'")
 }
 
-pub(super) async fn steer<P: Provider + 'static, H: Host + 'static>(
-    node: &Node<P, H>,
+pub(super) async fn steer<P: Provider + 'static>(
+    node: &Daemon<P>,
     req: SteerSessionMsg,
 ) -> Result<()> {
     let rt = node.runtime.read().await.clone();

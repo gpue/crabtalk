@@ -3,13 +3,9 @@
 //! Uses `Env<()>` with InMemoryStorage. Every test gets its own
 //! in-memory storage — no shared global state, no filesystem I/O, no node.
 
-use crabtalk_runtime::{Config, Env, Runtime};
+use crabtalk_runtime::{Config, Runtime};
 use futures_util::StreamExt;
-use std::{
-    collections::BTreeMap,
-    path::PathBuf,
-    sync::{Arc, RwLock},
-};
+use std::sync::Arc;
 use wcore::{
     AgentConfig, AgentEvent, AgentStopReason,
     model::Model,
@@ -24,20 +20,14 @@ struct TestCfg;
 impl Config for TestCfg {
     type Storage = InMemoryStorage;
     type Provider = TestProvider;
-    type Host = ();
+    type Env = ();
 }
 
-/// Build a `Runtime` from a `TestProvider`.
 fn runtime(provider: TestProvider) -> Runtime<TestCfg> {
     let storage = Arc::new(InMemoryStorage::new());
-    let cwd = PathBuf::from("/test");
-    let scopes = Arc::new(RwLock::new(BTreeMap::new()));
-    let cwds = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
-    let asks = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
-    let env = Env::new(cwd, (), scopes, cwds, asks);
     Runtime::new(
         Model::new(provider),
-        env,
+        Arc::new(()),
         storage,
         wcore::ToolRegistry::new(),
     )
