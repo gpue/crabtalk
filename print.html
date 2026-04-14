@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-86ebca6a.js";
+            window.path_to_searchindex_js = "searchindex-21ff07ff.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-0568fcff.js"></script>
+        <script src="toc-48fce9c2.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -781,6 +781,10 @@ enforced — it exists in the format but has no runtime effect.</li>
 </ul>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="0038---memory"><a class="header" href="#0038---memory">0038 - Memory</a></h1>
+<blockquote>
+<p><strong>Superseded by <a href="#0150---memory-store">0150 - Memory Store</a>.</strong>
+The file-per-entry premise was replaced by a single binary db file with a markdown dump tree for humans. <code>description</code> is gone; <code>aliases</code> and <code>EntryKind</code> (Note / Archive / Prompt) are new; the reserved <code>global</code> Prompt entry replaces <code>MEMORY.md</code>.</p>
+</blockquote>
 <ul>
 <li>Feature Name: Memory System</li>
 <li>Start Date: 2026-02-10</li>
@@ -1001,7 +1005,7 @@ Receives the agent config, returns a modified config. This is where the system
 prompt is composed. The <code>Env</code> implementation chains:</p>
 <ol>
 <li>Environment block (OS, shell, platform).</li>
-<li>Memory prompt (MEMORY.md content as <code>&lt;memory&gt;</code> block).</li>
+<li>Memory prompt — behavioural guidance for the memory tools (see <a href="#0150---memory-store">0150</a>).</li>
 <li>Resource hints (available MCP servers, available skills).</li>
 <li>Scope block (if agent has restricted skills/MCPs/members, appends a <code>&lt;scope&gt;</code>
 XML block listing allowed resources).</li>
@@ -1555,6 +1559,153 @@ logic needed.</p>
 recall tool searches across archived segments. See <a href="https://github.com/crabtalk/crabtalk/issues/101">#101 (revised)</a> for
 the pluggable memory provider aligned with this model.</p>
 <div style="break-before: page; page-break-before: always;"></div>
+<h1 id="0150---memory-store"><a class="header" href="#0150---memory-store">0150 - Memory Store</a></h1>
+<ul>
+<li>Feature Name: Memory Store</li>
+<li>Start Date: 2026-04-14</li>
+<li>Discussion: <a href="https://github.com/crabtalk/crabtalk/issues/38">#38</a></li>
+<li>Crates: memory, crabtalk, runtime</li>
+<li>Supersedes: <a href="#0038---memory">0038 (Memory)</a></li>
+</ul>
+<h2 id="summary-12"><a class="header" href="#summary-12">Summary</a></h2>
+<p>A standalone <code>crabtalk-memory</code> crate backing agent memory with a single binary db file, atomic persistence, and BM25 recall. The markdown tree is a human-facing export — not the primary store. Entries come in two kinds: <code>Note</code> (agent-written via <code>remember</code>/<code>forget</code>) and <code>Archive</code> (compaction output). The agent’s system prompt is human-managed via <code>Crab.md</code> (existing layered-instructions mechanism) — the memory store has no opinion on it.</p>
+<h2 id="motivation-12"><a class="header" href="#motivation-12">Motivation</a></h2>
+<p>RFC 0038 bet on file-per-entry markdown as the primary store. In practice that premise did not hold:</p>
+<ul>
+<li><strong>Atomic writes don’t compose across many files.</strong> Every remember/forget touched an entry file plus a sidecar index; a crash mid-op left the tree inconsistent. A single-file db is atomic by rename+fsync.</li>
+<li><strong>Compaction archives need a store.</strong> Agent-First (<a href="#0135---agent-first-protocol">0135</a>) made compaction archives first-class long-term memory. Archives share recall and lifecycle with notes, but aren’t user-editable text — they’re generated output. A kind-typed entry in the db is the right home.</li>
+<li><strong>Aliases improve recall.</strong> Humans reach for an entry under several names (“release” / “ship” / “deploy”). BM25 needs them as indexable terms, which frontmatter had no slot for.</li>
+<li><strong>Dump/load still matters for humans.</strong> Users want to read and edit memory with a text editor or mdbook. That’s solved by exporting the db as a markdown tree on demand, not by making the tree the source of truth.</li>
+</ul>
+<p>A separate observation that shaped the API surface:</p>
+<ul>
+<li><strong>The system prompt is not memory.</strong> 0038 carried a <code>MEMORY.md</code> curated overview that the agent could rewrite via a dedicated <code>memory</code> tool. That conflated two different things: persistent recall (the agent’s notes) and instructions (the human’s prompt). It also gave the agent a footgun — overwriting the whole thing in a single tool call with no diff. Killed: the <code>memory</code> tool, the <code>Prompt</code> entry kind, and the reserved <code>global</code> name. The system prompt now lives in <code>Crab.md</code> (already a file, already layered, already human-edited). If a human wants the agent to edit it, they grant that in prose inside <code>Crab.md</code> and the agent uses the standard file-edit tools.</li>
+</ul>
+<h2 id="design-12"><a class="header" href="#design-12">Design</a></h2>
+<h3 id="crate-layout"><a class="header" href="#crate-layout">Crate layout</a></h3>
+<p><code>crabtalk-memory</code> is a standalone crate. The <code>crabtalk</code> hooks own one <code>Memory</code> handle and expose a <code>SharedStore = Arc&lt;RwLock&lt;Memory&gt;&gt;</code> to the runtime so compaction can write archives and session resume can read them.</p>
+<h3 id="binary-file-format-crmem-v1"><a class="header" href="#binary-file-format-crmem-v1">Binary file format (CRMEM v1)</a></h3>
+<p>All integers are little-endian. Strings are UTF-8, length-prefixed by a <code>u32</code> byte count (no NUL terminator). The whole file is one contiguous blob — no sections, no index, no padding.</p>
+<p><strong>Header — 16 bytes:</strong></p>
+<pre><code class="language-text">offset  size  field      value
+------  ----  ---------  -------------------------------------------------
+ 0       6    magic      "CRMEM\0"
+ 6       4    version    u32  (= 1)
+10       2    flags      u16  (= 0; unknown bits rejected on read)
+12       4    reserved   [u8; 4] (= 0)
+</code></pre>
+<p><strong>Body:</strong></p>
+<pre><code class="language-text">size  field        notes
+----  -----------  -----------------------------------------------------
+ 8    next_id      u64   monotonic EntryId allocator; persisted so
+                         IDs stay stable across open/close
+ 4    entry_count  u32
+ *    entries      entry_count repetitions of the per-entry record
+</code></pre>
+<p><strong>Per entry:</strong></p>
+<pre><code class="language-text">size  field        notes
+----  -----------  -----------------------------------------------------
+ 8    id           u64
+ 8    created_at   u64   unix seconds
+ 4    kind         u32   0 = Note, 1 = Archive
+ 4    name_len     u32
+ *    name         utf8 bytes, name_len long
+ 4    content_len  u32
+ *    content      utf8 bytes, content_len long
+ 4    alias_count  u32
+ *    aliases      alias_count repetitions of { u32 len + utf8 bytes }
+</code></pre>
+<p><code>kind</code> is u32 rather than u8 so the fixed entry prefix stays 4-byte aligned — cheap hygiene for any future on-disk index work. The inverted BM25 index is <strong>not</strong> persisted; it’s rebuilt from entries on load. Keeps the file small and the format boring.</p>
+<p><strong>Reader invariants:</strong> magic mismatch, wrong version, non-zero flags, truncated body, invalid UTF-8, or an unknown <code>kind</code> value all fail the open with <code>BadFormat</code>. A missing file opens an empty db (the file is created on the first successful write).</p>
+<h3 id="persistence-1"><a class="header" href="#persistence-1">Persistence</a></h3>
+<p>Every <code>apply(Op)</code> mutates RAM then flushes atomically. The flush sequence is:</p>
+<ol>
+<li>Encode the entire db to an in-memory <code>Vec&lt;u8&gt;</code>.</li>
+<li><code>create_dir_all(parent)</code> if needed.</li>
+<li>Write to a sibling temp file <code>{name}.tmp</code> and <code>fsync</code> it.</li>
+<li><code>rename(tmp, path)</code> — atomic on POSIX when on the same filesystem.</li>
+<li><code>fsync</code> the parent directory so the rename itself is durable.</li>
+</ol>
+<p>A flush failure leaves RAM ahead of disk until the next successful op or the next <code>open</code> (which re-reads the file). WAL closes that window in v2. <code>Memory::checkpoint()</code> forces the same flush without a mutation.</p>
+<h3 id="entry-model"><a class="header" href="#entry-model">Entry model</a></h3>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>enum EntryKind { Note, Archive }
+
+struct Entry {
+    id: u64,
+    name: String,
+    content: String,
+    aliases: Vec&lt;String&gt;,
+    created_at: u64,
+    kind: EntryKind,
+}
+<span class="boring">}</span></code></pre>
+<ul>
+<li><strong>Note</strong> — remember/forget entries.</li>
+<li><strong>Archive</strong> — compaction output. Written by the runtime during compaction, surfaced by <code>recall</code> as long-term memory (per 0135).</li>
+</ul>
+<p>Kind is immutable per entry: <code>Update</code> rewrites content and aliases but keeps kind; use <code>Remove</code> + <code>Add</code> to change it.</p>
+<h3 id="write-ops"><a class="header" href="#write-ops">Write ops</a></h3>
+<p>Writes go through an <code>Op</code> enum:</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>enum Op {
+    Add    { name, content, aliases, kind },
+    Update { name, content, aliases },
+    Alias  { name, aliases },
+    Remove { name },
+}
+<span class="boring">}</span></code></pre>
+<p><code>Memory::apply(op)</code> mutates + flushes. Callers never touch <code>fs::write</code> directly.</p>
+<h3 id="recall"><a class="header" href="#recall">Recall</a></h3>
+<p>BM25 with Lucene-style IDF (<code>ln((n - df + 0.5)/(df + 0.5) + 1.0)</code>), k1=1.2, b=0.75. The index is an inverted index of tokens from entry content and aliases, keyed by <code>EntryId</code>. Search walks the posting lists for query terms instead of rescanning every entry on every query.</p>
+<h3 id="auto-recall-1"><a class="header" href="#auto-recall-1">Auto-recall</a></h3>
+<p>Before each agent turn (<code>before_run</code>), the hook takes the first 8 words of the last user message, runs BM25 search, and injects hits as an auto-injected <code>&lt;recall&gt;</code> user turn. Auto-injected messages are not persisted and refresh every turn.</p>
+<h3 id="system-prompt"><a class="header" href="#system-prompt">System prompt</a></h3>
+<p>The hook contributes one <code>&lt;system_prompt&gt;</code> fragment: the contents of <code>prompts/memory.md</code>, which tells the agent <em>when</em> to use the memory tools (tool <em>signatures</em> come from each input struct’s <code>///</code> doc comment via schemars). The agent’s identity / behavior prompt is <strong>not</strong> the memory store’s responsibility — it’s <code>Crab.md</code>, layered from <code>&lt;config_dir&gt;/Crab.md</code> and any project-local <code>Crab.md</code> walked up from CWD (see <code>daemon::host::discover_instructions</code>).</p>
+<h3 id="tools-1"><a class="header" href="#tools-1">Tools</a></h3>
+<p>Three tools exposed to the agent:</p>
+<ul>
+<li><code>remember(name, content, aliases)</code> — upsert a <code>Note</code>.</li>
+<li><code>forget(name)</code> — delete a <code>Note</code>.</li>
+<li><code>recall(query, limit)</code> — BM25 search, returns formatted results.</li>
+</ul>
+<p>There is no <code>memory</code> tool. Editing the agent’s system prompt is a human action against <code>Crab.md</code>. If the human wants to delegate that authority, they say so in <code>Crab.md</code> and the agent uses the standard file-edit tools — no special-case tool, no reserved entry name, no parallel write path.</p>
+<h3 id="dump--load"><a class="header" href="#dump--load">Dump / load</a></h3>
+<p><code>Memory::dump(dir)</code> writes the db as an mdbook-ready tree for humans:</p>
+<pre><code class="language-text">brain/
+  book.toml               ← seeded on first dump; user edits survive re-dumps
+  SUMMARY.md              ← mdbook ToC (ignored on load)
+  notes/{name}.md
+  archives/{name}.md
+</code></pre>
+<p>The seeded <code>book.toml</code> sets <code>src = "."</code> so <code>mdbook serve brain/</code> works against the tree as-is — no shuffling into an <code>src/</code> subdirectory. It’s only written when absent; any customizations survive later dumps.</p>
+<p>Each entry file starts with an HTML metadata block, followed by pure markdown content:</p>
+<pre><code class="language-markdown">&lt;div id="meta"&gt;
+&lt;dl&gt;
+  &lt;dt&gt;Created&lt;/dt&gt;
+  &lt;dd&gt;&lt;time datetime="2026-04-14T10:23:45Z"&gt;2026-04-14T10:23:45Z&lt;/time&gt;&lt;/dd&gt;
+  &lt;dt&gt;Aliases&lt;/dt&gt;
+  &lt;dd&gt;&lt;ul&gt;&lt;li&gt;ship&lt;/li&gt;&lt;li&gt;release&lt;/li&gt;&lt;/ul&gt;&lt;/dd&gt;
+&lt;/dl&gt;
+&lt;/div&gt;
+
+prod rollout steps ...
+</code></pre>
+<p>Chosen for mdbook: <code>&lt;dl&gt;</code> / <code>&lt;dt&gt;</code> / <code>&lt;dd&gt;</code> is the semantic HTML for key-value metadata, renders as a labeled info card, and doesn’t pollute mdbook’s heading tree. <code>&lt;time datetime="..."&gt;</code> round-trips the exact unix timestamp. A file that doesn’t start with <code>&lt;div id="meta"&gt;</code> is treated as pure content with no metadata.</p>
+<p><code>Memory::load(dir)</code> reads the tree and <em>replaces</em> the db. It validates fully before mutating — a mid-load error leaves the current state untouched. Each kind’s subdirectory is cleared on <code>dump</code> so renames and deletes don’t leave orphan files behind; anything else in <code>dir</code> (e.g. a customized <code>book.toml</code>, a <code>theme/</code> directory) is left alone.</p>
+<h2 id="alternatives-11"><a class="header" href="#alternatives-11">Alternatives</a></h2>
+<p><strong>Stay with file-per-entry (0038).</strong> Rejected — compaction archives need a real store, and atomic multi-file writes would require WAL anyway. A single file gets atomicity for free.</p>
+<p><strong>SQLite.</strong> Overkill for 10²–10³ entries, adds a dependency and schema migrations. A 200-line hand-rolled format is simpler and easier to inspect with <code>xxd</code>.</p>
+<p><strong>Embedding-based search.</strong> Still rejected for the same reasons as 0038: requires a vector store and embedding model. BM25 is fast, dependency-free, and works well at the entry sizes agents produce.</p>
+<h2 id="unresolved-questions-11"><a class="header" href="#unresolved-questions-11">Unresolved Questions</a></h2>
+<ul>
+<li>WAL for crash safety in the window between the RAM mutation and the atomic flush.</li>
+<li>Should <code>load()</code> merge instead of replace?</li>
+<li>Should archives expire or be garbage-collected past some age / count?</li>
+</ul>
+<div style="break-before: page; page-break-before: always;"></div>
 <h1 id="superseded-rfcs"><a class="header" href="#superseded-rfcs">Superseded RFCs</a></h1>
 <p>RFCs that have been replaced by newer designs. Kept for historical reference.</p>
 <div class="table-wrapper">
@@ -1563,6 +1714,7 @@ the pluggable memory provider aligned with this model.</p>
 <tr><th>RFC</th><th>Title</th><th>Superseded by</th></tr>
 </thead>
 <tbody>
+<tr><td><a href="#0038---memory">0038</a></td><td>Memory</td><td><a href="#0150---memory-store">0150 - Memory Store</a></td></tr>
 <tr><td><a href="rfcs/0064-session.html">0064</a></td><td>Session</td><td><a href="#0135---agent-first-protocol">0135 - Agent-First Protocol</a></td></tr>
 <tr><td><a href="rfcs/0078-compact-session.html">0078</a></td><td>Compact Session</td><td><a href="#0135---agent-first-protocol">0135 - Agent-First Protocol</a></td></tr>
 </tbody>

@@ -3,7 +3,7 @@
     <head>
         <!-- Book generated using mdBook -->
         <meta charset="UTF-8">
-        <title>0121 - Event Bus - The Crabtalk RFC Book</title>
+        <title>0150 - Memory Store - The Crabtalk RFC Book</title>
 
 
         <!-- Custom HTML head -->
@@ -146,7 +146,7 @@
                         <a href="https://github.com/crabtalk/crabtalk" title="Git repository" aria-label="Git repository">
                             <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
                         </a>
-                        <a href="https://github.com/crabtalk/crabtalk/edit/main/docs/src/src/rfcs/0121-event-bus.md" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
+                        <a href="https://github.com/crabtalk/crabtalk/edit/main/docs/src/src/rfcs/0150-memory-store.md" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
                             <span class=fa-svg id="git-edit-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M421.7 220.3l-11.3 11.3-22.6 22.6-205 205c-6.6 6.6-14.8 11.5-23.8 14.1L30.8 511c-8.4 2.5-17.5 .2-23.7-6.1S-1.5 489.7 1 481.2L38.7 353.1c2.6-9 7.5-17.2 14.1-23.8l205-205 22.6-22.6 11.3-11.3 33.9 33.9 62.1 62.1 33.9 33.9zM96 353.9l-9.3 9.3c-.9 .9-1.6 2.1-2 3.4l-25.3 86 86-25.3c1.3-.4 2.5-1.1 3.4-2l9.3-9.3H112c-8.8 0-16-7.2-16-16V353.9zM453.3 19.3l39.4 39.4c25 25 25 65.5 0 90.5l-14.5 14.5-22.6 22.6-11.3 11.3-33.9-33.9-62.1-62.1L314.3 67.7l11.3-11.3 22.6-22.6 14.5-14.5c25-25 65.5-25 90.5 0z"/></svg></span>
                         </a>
 
@@ -180,163 +180,162 @@
 
                 <div id="mdbook-content" class="content">
                     <main>
-                        <h1 id="0121---event-bus"><a class="header" href="#0121---event-bus">0121 - Event Bus</a></h1>
+                        <h1 id="0150---memory-store"><a class="header" href="#0150---memory-store">0150 - Memory Store</a></h1>
 <ul>
-<li>Feature Name: Unified Event Bus</li>
-<li>Start Date: 2026-04-04</li>
-<li>Discussion: <a href="https://github.com/crabtalk/crabtalk/issues/121">#121</a></li>
-<li>Crates: daemon, core, runtime</li>
-<li>Updates: <a href="0080-cron.html">0080 (Cron)</a></li>
+<li>Feature Name: Memory Store</li>
+<li>Start Date: 2026-04-14</li>
+<li>Discussion: <a href="https://github.com/crabtalk/crabtalk/issues/38">#38</a></li>
+<li>Crates: memory, crabtalk, runtime</li>
+<li>Supersedes: <a href="0038-memory.html">0038 (Memory)</a></li>
 </ul>
 <h2 id="summary"><a class="header" href="#summary">Summary</a></h2>
-<p>A daemon-level event bus that routes named events to target agents via
-exact-match subscriptions. Agent completion is the first built-in event source.
-The bus also enables non-blocking delegation and ad-hoc worker agents.</p>
+<p>A standalone <code>crabtalk-memory</code> crate backing agent memory with a single binary db file, atomic persistence, and BM25 recall. The markdown tree is a human-facing export — not the primary store. Entries come in two kinds: <code>Note</code> (agent-written via <code>remember</code>/<code>forget</code>) and <code>Archive</code> (compaction output). The agent’s system prompt is human-managed via <code>Crab.md</code> (existing layered-instructions mechanism) — the memory store has no opinion on it.</p>
 <h2 id="motivation"><a class="header" href="#motivation">Motivation</a></h2>
-<p>The daemon can trigger agents on a schedule (cron) and run agents on user
-request (protocol). But there’s no way for one agent’s completion to trigger
-another agent. The Signal pipeline (crabtalk/app#59) needs exactly this:</p>
-<pre><code>RSS fetch → Scout classifies → Crab enriches → client notification
-</code></pre>
-<p>Each stage produces a result that the next stage consumes. Without an event
-system, this requires the client to orchestrate the chain — polling, waiting,
-re-sending. The daemon should own this.</p>
-<p>Separately, <code>delegate</code> blocks the parent agent until all tasks complete. For
-background research or parallel work, this is a limitation. If the daemon can
-route agent completion events, non-blocking delegation falls out for free.</p>
+<p>RFC 0038 bet on file-per-entry markdown as the primary store. In practice that premise did not hold:</p>
+<ul>
+<li><strong>Atomic writes don’t compose across many files.</strong> Every remember/forget touched an entry file plus a sidecar index; a crash mid-op left the tree inconsistent. A single-file db is atomic by rename+fsync.</li>
+<li><strong>Compaction archives need a store.</strong> Agent-First (<a href="0135-agent-first.html">0135</a>) made compaction archives first-class long-term memory. Archives share recall and lifecycle with notes, but aren’t user-editable text — they’re generated output. A kind-typed entry in the db is the right home.</li>
+<li><strong>Aliases improve recall.</strong> Humans reach for an entry under several names (“release” / “ship” / “deploy”). BM25 needs them as indexable terms, which frontmatter had no slot for.</li>
+<li><strong>Dump/load still matters for humans.</strong> Users want to read and edit memory with a text editor or mdbook. That’s solved by exporting the db as a markdown tree on demand, not by making the tree the source of truth.</li>
+</ul>
+<p>A separate observation that shaped the API surface:</p>
+<ul>
+<li><strong>The system prompt is not memory.</strong> 0038 carried a <code>MEMORY.md</code> curated overview that the agent could rewrite via a dedicated <code>memory</code> tool. That conflated two different things: persistent recall (the agent’s notes) and instructions (the human’s prompt). It also gave the agent a footgun — overwriting the whole thing in a single tool call with no diff. Killed: the <code>memory</code> tool, the <code>Prompt</code> entry kind, and the reserved <code>global</code> name. The system prompt now lives in <code>Crab.md</code> (already a file, already layered, already human-edited). If a human wants the agent to edit it, they grant that in prose inside <code>Crab.md</code> and the agent uses the standard file-edit tools.</li>
+</ul>
 <h2 id="design"><a class="header" href="#design">Design</a></h2>
-<h3 id="event-bus"><a class="header" href="#event-bus">Event bus</a></h3>
-<p>An in-memory subscription table that matches events by exact source string and
-fires target agents with the event payload as message content.</p>
-<pre><code class="language-toml"># events.toml
-[[subscription]]
-id = 1
-source = "agent:scout:done"
-target_agent = "crab"
-once = false
+<h3 id="crate-layout"><a class="header" href="#crate-layout">Crate layout</a></h3>
+<p><code>crabtalk-memory</code> is a standalone crate. The <code>crabtalk</code> hooks own one <code>Memory</code> handle and expose a <code>SharedStore = Arc&lt;RwLock&lt;Memory&gt;&gt;</code> to the runtime so compaction can write archives and session resume can read them.</p>
+<h3 id="binary-file-format-crmem-v1"><a class="header" href="#binary-file-format-crmem-v1">Binary file format (CRMEM v1)</a></h3>
+<p>All integers are little-endian. Strings are UTF-8, length-prefixed by a <code>u32</code> byte count (no NUL terminator). The whole file is one contiguous blob — no sections, no index, no padding.</p>
+<p><strong>Header — 16 bytes:</strong></p>
+<pre><code class="language-text">offset  size  field      value
+------  ----  ---------  -------------------------------------------------
+ 0       6    magic      "CRMEM\0"
+ 6       4    version    u32  (= 1)
+10       2    flags      u16  (= 0; unknown bits rejected on read)
+12       4    reserved   [u8; 4] (= 0)
 </code></pre>
-<p>Follows the CronStore pattern: HashMap-backed, TOML-persisted, auto-incrementing
-IDs, atomic writes (tmp + rename). Survives runtime reloads.</p>
-<h3 id="event-sources"><a class="header" href="#event-sources">Event sources</a></h3>
-<p>Events are namespaced strings. Two source types exist today:</p>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Source</th><th>Example</th><th>Emitter</th></tr>
-</thead>
-<tbody>
-<tr><td>Agent completion</td><td><code>agent:scout:done</code></td><td>Daemon, via <code>on_agent_event</code> hook</td></tr>
-<tr><td>External</td><td><code>rss:fetch</code>, <code>signal:classified</code></td><td>Client or adapter, via <code>PublishEvent</code></td></tr>
-</tbody>
-</table>
-</div>
-<p>Agent completion events are emitted automatically when a conversation stream
-ends. The payload is the agent’s final text response.</p>
-<p>External events are published via the <code>PublishEvent</code> protocol message — any
-client, adapter, or webhook handler can fire events into the bus.</p>
-<h3 id="routing"><a class="header" href="#routing">Routing</a></h3>
-<pre><code>Event arrives (via DaemonEvent::PublishEvent)
-  → event loop calls EventBus::publish() inline (no spawn)
-  → exact match source against subscription table
-  → for each match: fire target agent via SendMsg (fire-and-forget)
-  → if once: remove subscription, persist
+<p><strong>Body:</strong></p>
+<pre><code class="language-text">size  field        notes
+----  -----------  -----------------------------------------------------
+ 8    next_id      u64   monotonic EntryId allocator; persisted so
+                         IDs stay stable across open/close
+ 4    entry_count  u32
+ *    entries      entry_count repetitions of the per-entry record
 </code></pre>
-<p>Events always start new work. There is no injection into active conversations —
-that’s a separate concern (#117).</p>
-<p>Fired agents receive the payload as message content with sender
-<code>"event:{source}"</code>. This follows the established convention
-(<code>"delegate:{id}"</code>, <code>"cron"</code>) for non-user senders.</p>
-<h3 id="protocol"><a class="header" href="#protocol">Protocol</a></h3>
-<p>Four new operations on the <code>Server</code> trait:</p>
-<pre><code class="language-protobuf">message SubscribeEventMsg {
-  string source = 1;
-  string target_agent = 2;
-  bool once = 3;
-}
-
-message UnsubscribeEventMsg { uint64 id = 1; }
-message ListSubscriptionsMsg {}
-message PublishEventMsg { string source = 1; string payload = 2; }
+<p><strong>Per entry:</strong></p>
+<pre><code class="language-text">size  field        notes
+----  -----------  -----------------------------------------------------
+ 8    id           u64
+ 8    created_at   u64   unix seconds
+ 4    kind         u32   0 = Note, 1 = Archive
+ 4    name_len     u32
+ *    name         utf8 bytes, name_len long
+ 4    content_len  u32
+ *    content      utf8 bytes, content_len long
+ 4    alias_count  u32
+ *    aliases      alias_count repetitions of { u32 len + utf8 bytes }
 </code></pre>
-<p>Responses: <code>SubscriptionInfo</code> for subscribe, <code>Pong</code> for unsubscribe/publish,
-<code>SubscriptionList</code> for list.</p>
-<h3 id="daemoneventpublishevent"><a class="header" href="#daemoneventpublishevent">DaemonEvent::PublishEvent</a></h3>
-<p>All publish paths route through a single <code>DaemonEvent::PublishEvent</code> variant
-in the central event loop. This avoids lock-ordering issues — the event bus
-mutex is only acquired inside the sequential event loop, never from the
-protocol handler or hook callbacks directly.</p>
+<p><code>kind</code> is u32 rather than u8 so the fixed entry prefix stays 4-byte aligned — cheap hygiene for any future on-disk index work. The inverted BM25 index is <strong>not</strong> persisted; it’s rebuilt from entries on load. Keeps the file small and the format boring.</p>
+<p><strong>Reader invariants:</strong> magic mismatch, wrong version, non-zero flags, truncated body, invalid UTF-8, or an unknown <code>kind</code> value all fail the open with <code>BadFormat</code>. A missing file opens an empty db (the file is created on the first successful write).</p>
+<h3 id="persistence"><a class="header" href="#persistence">Persistence</a></h3>
+<p>Every <code>apply(Op)</code> mutates RAM then flushes atomically. The flush sequence is:</p>
+<ol>
+<li>Encode the entire db to an in-memory <code>Vec&lt;u8&gt;</code>.</li>
+<li><code>create_dir_all(parent)</code> if needed.</li>
+<li>Write to a sibling temp file <code>{name}.tmp</code> and <code>fsync</code> it.</li>
+<li><code>rename(tmp, path)</code> — atomic on POSIX when on the same filesystem.</li>
+<li><code>fsync</code> the parent directory so the rename itself is durable.</li>
+</ol>
+<p>A flush failure leaves RAM ahead of disk until the next successful op or the next <code>open</code> (which re-reads the file). WAL closes that window in v2. <code>Memory::checkpoint()</code> forces the same flush without a mutation.</p>
+<h3 id="entry-model"><a class="header" href="#entry-model">Entry model</a></h3>
 <pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
 </span><span class="boring">fn main() {
-</span>DaemonEvent::PublishEvent { source, payload } =&gt; {
-    self.events.lock().await.publish(&amp;source, &amp;payload);
+</span>enum EntryKind { Note, Archive }
+
+struct Entry {
+    id: u64,
+    name: String,
+    content: String,
+    aliases: Vec&lt;String&gt;,
+    created_at: u64,
+    kind: EntryKind,
 }
 <span class="boring">}</span></code></pre>
-<h3 id="non-blocking-delegation"><a class="header" href="#non-blocking-delegation">Non-blocking delegation</a></h3>
-<p>The <code>delegate</code> tool gains a <code>background: bool</code> field. When true:</p>
-<ol>
-<li>Tasks are spawned via the existing <code>spawn_agent_task</code> mechanism</li>
-<li><code>dispatch_delegate</code> returns immediately with task IDs</li>
-<li>The parent agent continues working</li>
-<li>When each task completes, the daemon emits <code>agent:{name}:done</code></li>
-<li>Event bus routes the completion to any matching subscriptions</li>
-</ol>
-<p>No new mechanism — just the existing spawn infrastructure plus the event bus.</p>
-<h3 id="worker-pseudo-agent"><a class="header" href="#worker-pseudo-agent">Worker pseudo-agent</a></h3>
-<p>A built-in <code>worker</code> agent registered at daemon startup alongside <code>crab</code>.
-Always available as a delegate target without pre-configuration:</p>
 <ul>
-<li>Inherits the system agent’s thinking setting</li>
-<li>Gets the full tool registry (no explicit filter)</li>
-<li>Ephemeral — sessions are killed after task completion (existing behavior)</li>
-<li>No <code>members</code> list gate — <code>worker</code> is always a valid delegate target</li>
+<li><strong>Note</strong> — remember/forget entries.</li>
+<li><strong>Archive</strong> — compaction output. Written by the runtime during compaction, surfaced by <code>recall</code> as long-term memory (per 0135).</li>
 </ul>
-<p>This eliminates the friction of configuring named agents for ad-hoc tasks like
-“read these files and summarize” or “search for X in the codebase.”</p>
-<h2 id="what-this-is-not"><a class="header" href="#what-this-is-not">What this is NOT</a></h2>
+<p>Kind is immutable per entry: <code>Update</code> rewrites content and aliases but keeps kind; use <code>Remove</code> + <code>Add</code> to change it.</p>
+<h3 id="write-ops"><a class="header" href="#write-ops">Write ops</a></h3>
+<p>Writes go through an <code>Op</code> enum:</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>enum Op {
+    Add    { name, content, aliases, kind },
+    Update { name, content, aliases },
+    Alias  { name, aliases },
+    Remove { name },
+}
+<span class="boring">}</span></code></pre>
+<p><code>Memory::apply(op)</code> mutates + flushes. Callers never touch <code>fs::write</code> directly.</p>
+<h3 id="recall"><a class="header" href="#recall">Recall</a></h3>
+<p>BM25 with Lucene-style IDF (<code>ln((n - df + 0.5)/(df + 0.5) + 1.0)</code>), k1=1.2, b=0.75. The index is an inverted index of tokens from entry content and aliases, keyed by <code>EntryId</code>. Search walks the posting lists for query terms instead of rescanning every entry on every query.</p>
+<h3 id="auto-recall"><a class="header" href="#auto-recall">Auto-recall</a></h3>
+<p>Before each agent turn (<code>before_run</code>), the hook takes the first 8 words of the last user message, runs BM25 search, and injects hits as an auto-injected <code>&lt;recall&gt;</code> user turn. Auto-injected messages are not persisted and refresh every turn.</p>
+<h3 id="system-prompt"><a class="header" href="#system-prompt">System prompt</a></h3>
+<p>The hook contributes one <code>&lt;system_prompt&gt;</code> fragment: the contents of <code>prompts/memory.md</code>, which tells the agent <em>when</em> to use the memory tools (tool <em>signatures</em> come from each input struct’s <code>///</code> doc comment via schemars). The agent’s identity / behavior prompt is <strong>not</strong> the memory store’s responsibility — it’s <code>Crab.md</code>, layered from <code>&lt;config_dir&gt;/Crab.md</code> and any project-local <code>Crab.md</code> walked up from CWD (see <code>daemon::host::discover_instructions</code>).</p>
+<h3 id="tools"><a class="header" href="#tools">Tools</a></h3>
+<p>Three tools exposed to the agent:</p>
 <ul>
-<li><strong>Not a message broker.</strong> No durability, no exactly-once delivery, no dead
-letter queues. Fire-and-forget with best-effort delivery.</li>
-<li><strong>Not an orchestration DAG.</strong> No conditional routing, no fan-out/fan-in.
-Agents subscribe to events — that’s it.</li>
-<li><strong>Not a replacement for <code>delegate</code>.</strong> Delegation is synchronous and returns
-results inline. Events are asynchronous and deliver results out-of-band.
-<code>background: true</code> bridges the two.</li>
+<li><code>remember(name, content, aliases)</code> — upsert a <code>Note</code>.</li>
+<li><code>forget(name)</code> — delete a <code>Note</code>.</li>
+<li><code>recall(query, limit)</code> — BM25 search, returns formatted results.</li>
 </ul>
-<h2 id="updates"><a class="header" href="#updates">Updates</a></h2>
-<h3 id="0080---cron"><a class="header" href="#0080---cron">0080 - Cron</a></h3>
-<p>The cron system continues to work as-is. Cron entries fire skills via the
-daemon event channel — this is unchanged. A future iteration may refactor cron
-as an event source adapter, emitting <code>cron:{id}:fired</code> events into the bus, but
-this is not in scope. The event bus is additive, not a cron replacement.</p>
+<p>There is no <code>memory</code> tool. Editing the agent’s system prompt is a human action against <code>Crab.md</code>. If the human wants to delegate that authority, they say so in <code>Crab.md</code> and the agent uses the standard file-edit tools — no special-case tool, no reserved entry name, no parallel write path.</p>
+<h3 id="dump--load"><a class="header" href="#dump--load">Dump / load</a></h3>
+<p><code>Memory::dump(dir)</code> writes the db as an mdbook-ready tree for humans:</p>
+<pre><code class="language-text">brain/
+  book.toml               ← seeded on first dump; user edits survive re-dumps
+  SUMMARY.md              ← mdbook ToC (ignored on load)
+  notes/{name}.md
+  archives/{name}.md
+</code></pre>
+<p>The seeded <code>book.toml</code> sets <code>src = "."</code> so <code>mdbook serve brain/</code> works against the tree as-is — no shuffling into an <code>src/</code> subdirectory. It’s only written when absent; any customizations survive later dumps.</p>
+<p>Each entry file starts with an HTML metadata block, followed by pure markdown content:</p>
+<pre><code class="language-markdown">&lt;div id="meta"&gt;
+&lt;dl&gt;
+  &lt;dt&gt;Created&lt;/dt&gt;
+  &lt;dd&gt;&lt;time datetime="2026-04-14T10:23:45Z"&gt;2026-04-14T10:23:45Z&lt;/time&gt;&lt;/dd&gt;
+  &lt;dt&gt;Aliases&lt;/dt&gt;
+  &lt;dd&gt;&lt;ul&gt;&lt;li&gt;ship&lt;/li&gt;&lt;li&gt;release&lt;/li&gt;&lt;/ul&gt;&lt;/dd&gt;
+&lt;/dl&gt;
+&lt;/div&gt;
+
+prod rollout steps ...
+</code></pre>
+<p>Chosen for mdbook: <code>&lt;dl&gt;</code> / <code>&lt;dt&gt;</code> / <code>&lt;dd&gt;</code> is the semantic HTML for key-value metadata, renders as a labeled info card, and doesn’t pollute mdbook’s heading tree. <code>&lt;time datetime="..."&gt;</code> round-trips the exact unix timestamp. A file that doesn’t start with <code>&lt;div id="meta"&gt;</code> is treated as pure content with no metadata.</p>
+<p><code>Memory::load(dir)</code> reads the tree and <em>replaces</em> the db. It validates fully before mutating — a mid-load error leaves the current state untouched. Each kind’s subdirectory is cleared on <code>dump</code> so renames and deletes don’t leave orphan files behind; anything else in <code>dir</code> (e.g. a customized <code>book.toml</code>, a <code>theme/</code> directory) is left alone.</p>
 <h2 id="alternatives"><a class="header" href="#alternatives">Alternatives</a></h2>
-<p><strong>Agent completion triggers (no bus).</strong> A simpler design where completion of
-agent X directly triggers agent Y, without a general subscription mechanism.
-Rejected because the Signal pipeline needs external events (RSS fetch results)
-alongside agent completions — a bus handles both uniformly.</p>
-<p><strong>Glob matching on source patterns.</strong> The RFC originally proposed wildcard
-subscriptions like <code>"agent:*:done"</code>. Rejected for v1 — exact match covers all
-current use cases. Glob matching can be added when a real consumer needs it.</p>
-<p><strong>Template interpolation.</strong> The RFC originally proposed <code>{{payload}}</code>
-interpolation in a <code>prompt_template</code> field. Rejected — agents are the template
-engine. The payload goes in as-is; the agent’s instructions handle
-interpretation.</p>
+<p><strong>Stay with file-per-entry (0038).</strong> Rejected — compaction archives need a real store, and atomic multi-file writes would require WAL anyway. A single file gets atomicity for free.</p>
+<p><strong>SQLite.</strong> Overkill for 10²–10³ entries, adds a dependency and schema migrations. A 200-line hand-rolled format is simpler and easier to inspect with <code>xxd</code>.</p>
+<p><strong>Embedding-based search.</strong> Still rejected for the same reasons as 0038: requires a vector store and embedding model. BM25 is fast, dependency-free, and works well at the entry sizes agents produce.</p>
 <h2 id="unresolved-questions"><a class="header" href="#unresolved-questions">Unresolved Questions</a></h2>
 <ul>
-<li>Should there be a max subscription count?</li>
-<li>Should the bus detect infinite loops (agent A triggers B triggers A)?
-Currently fire-and-forget prevents stack overflow but allows unbounded
-chains of spawned tasks.</li>
+<li>WAL for crash safety in the window between the RAM mutation and the atomic flush.</li>
+<li>Should <code>load()</code> merge instead of replace?</li>
+<li>Should archives expire or be garbage-collected past some age / count?</li>
 </ul>
 
                     </main>
 
                     <nav class="nav-wrapper" aria-label="Page navigation">
                         <!-- Mobile navigation buttons -->
-                            <a rel="prev" href="../rfcs/0082-scoping.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                            <a rel="prev" href="../rfcs/0135-agent-first.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
-                            <a rel="next prefetch" href="../rfcs/0135-agent-first.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                            <a rel="next prefetch" href="../rfcs/superseded.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                             </a>
 
@@ -346,11 +345,11 @@ chains of spawned tasks.</li>
             </div>
 
             <nav class="nav-wide-wrapper" aria-label="Page navigation">
-                    <a rel="prev" href="../rfcs/0082-scoping.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                    <a rel="prev" href="../rfcs/0135-agent-first.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 
-                    <a rel="next prefetch" href="../rfcs/0135-agent-first.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                    <a rel="next prefetch" href="../rfcs/superseded.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                     </a>
             </nav>

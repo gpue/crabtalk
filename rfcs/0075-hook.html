@@ -35,10 +35,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-86ebca6a.js";
+            window.path_to_searchindex_js = "../searchindex-21ff07ff.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-0568fcff.js"></script>
+        <script src="../toc-48fce9c2.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -220,7 +220,7 @@ Receives the agent config, returns a modified config. This is where the system
 prompt is composed. The <code>Env</code> implementation chains:</p>
 <ol>
 <li>Environment block (OS, shell, platform).</li>
-<li>Memory prompt (MEMORY.md content as <code>&lt;memory&gt;</code> block).</li>
+<li>Memory prompt — behavioural guidance for the memory tools (see <a href="0150-memory-store.html">0150</a>).</li>
 <li>Resource hints (available MCP servers, available skills).</li>
 <li>Scope block (if agent has restricted skills/MCPs/members, appends a <code>&lt;scope&gt;</code>
 XML block listing allowed resources).</li>
