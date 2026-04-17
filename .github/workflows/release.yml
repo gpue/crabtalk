@@ -33,12 +33,11 @@ jobs:
         run: rustup target add ${{ matrix.target }}
 
       - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }} -p crabtalkd
+        run: cargo build --release --target ${{ matrix.target }} -p crabtalk-tui
 
       - name: Package binary
         run: |
           cd target/${{ matrix.target }}/release
-          cp crabtalkd crabtalk
           tar czf ${{ github.workspace }}/${{ matrix.asset }} crabtalk
 
       - name: Upload artifact
