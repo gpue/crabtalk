@@ -3,13 +3,18 @@
 use crate::mcp::client::{self, McpPeer};
 use anyhow::Result;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use tokio::sync::Mutex;
 use wcore::model::Tool;
 
 /// A connected MCP server peer with its tool names.
+///
+/// Each peer has its own `Mutex` so that tool calls to different MCP servers
+/// can proceed concurrently. The outer `peers` lock is only held briefly for
+/// lookup/registration, never across async I/O.
 struct ConnectedPeer {
     name: String,
-    peer: McpPeer,
+    peer: Arc<Mutex<McpPeer>>,
     tools: Vec<String>,
 }
 
@@ -88,7 +93,7 @@ impl McpBridge {
 
         self.peers.lock().await.push(ConnectedPeer {
             name,
-            peer,
+            peer: Arc::new(Mutex::new(peer)),
             tools: tool_names.clone(),
         });
 
@@ -148,17 +153,23 @@ impl McpBridge {
 
     /// Call a tool by name, routing to the correct peer.
     ///
-    /// Returns `Ok` on success, `Err` for routing failures, arg parse
-    /// errors, MCP-reported tool errors, or transport failures.
+    /// The `peers` lock is held only for the lookup, then released before the
+    /// (potentially slow) HTTP/stdio round-trip so that concurrent tool calls
+    /// to *different* MCP servers can proceed in parallel.
     pub async fn call(&self, name: &str, arguments: &str) -> Result<String, String> {
-        let mut peers = self.peers.lock().await;
-        let connected = peers
-            .iter_mut()
-            .find(|p| p.tools.iter().any(|t| t.as_str() == name));
+        // Step 1: find the peer under the lock, clone the Arc, drop lock.
+        let peer = {
+            let peers = self.peers.lock().await;
+            let connected = peers
+                .iter()
+                .find(|p| p.tools.iter().any(|t| t.as_str() == name));
 
-        let Some(connected) = connected else {
-            return Err(format!("mcp tool '{name}' not available"));
-        };
+            let Some(connected) = connected else {
+                return Err(format!("mcp tool '{name}' not available"));
+            };
+
+            Arc::clone(&connected.peer)
+        }; // peers lock released here
 
         let args: Option<serde_json::Map<String, serde_json::Value>> = if arguments.is_empty() {
             None
@@ -169,7 +180,9 @@ impl McpBridge {
             )
         };
 
-        match connected.peer.call_tool(name, args).await {
+        // Step 2: call the peer with only its own per-peer lock held.
+        let mut peer_guard = peer.lock().await;
+        match peer_guard.call_tool(name, args).await {
             Ok(result) => {
                 let text = extract_text(&result.content);
                 if result.is_error == Some(true) {
