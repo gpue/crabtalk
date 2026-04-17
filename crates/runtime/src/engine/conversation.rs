@@ -14,7 +14,7 @@ use wcore::{
     storage::{SessionHandle, Storage},
 };
 
-use super::Runtime;
+use super::{ConversationIdentity, Runtime};
 
 fn archive_base_name(session_slug: &str) -> String {
     let nanos = SystemTime::now()
@@ -31,15 +31,9 @@ impl<C: Config> Runtime<C> {
             bail!("agent '{agent}' not registered");
         }
 
-        // 1. In-memory lookup.
-        {
-            let conversations = self.conversations.read().await;
-            for (id, conversation_mutex) in conversations.iter() {
-                let c = conversation_mutex.lock().await;
-                if c.agent == agent && c.created_by == created_by {
-                    return Ok(*id);
-                }
-            }
+        // 1. In-memory lookup via identity index (lock-free, no deadlock).
+        if let Some(id) = self.find_conversation_id(agent, created_by).await {
+            return Ok(id);
         }
 
         // 2. Storage lookup — find latest persisted session for this identity.
@@ -58,6 +52,13 @@ impl<C: Config> Runtime<C> {
                 .write()
                 .await
                 .insert(id, Arc::new(Mutex::new(conversation)));
+            self.conversation_identities
+                .write()
+                .await
+                .insert(id, ConversationIdentity {
+                    agent: agent.to_string(),
+                    created_by: created_by.to_string(),
+                });
             return Ok(id);
         }
 
@@ -75,6 +76,13 @@ impl<C: Config> Runtime<C> {
             .write()
             .await
             .insert(id, Arc::new(Mutex::new(conversation)));
+        self.conversation_identities
+            .write()
+            .await
+            .insert(id, ConversationIdentity {
+                agent: agent.to_string(),
+                created_by: created_by.to_string(),
+            });
         Ok(id)
     }
 
@@ -98,11 +106,19 @@ impl<C: Config> Runtime<C> {
             .write()
             .await
             .insert(id, Arc::new(Mutex::new(conversation)));
+        self.conversation_identities
+            .write()
+            .await
+            .insert(id, ConversationIdentity {
+                agent: snapshot.meta.agent.clone(),
+                created_by: snapshot.meta.created_by.clone(),
+            });
         Ok(id)
     }
 
     pub async fn close_conversation(&self, id: u64) -> bool {
         self.steering.write().await.remove(&id);
+        self.conversation_identities.write().await.remove(&id);
         self.conversations.write().await.remove(&id).is_some()
     }
 
@@ -129,10 +145,9 @@ impl<C: Config> Runtime<C> {
     }
 
     pub async fn find_conversation_id(&self, agent: &str, sender: &str) -> Option<u64> {
-        let conversations = self.conversations.read().await;
-        for (id, conv_mutex) in conversations.iter() {
-            let conv = conv_mutex.lock().await;
-            if conv.agent == agent && conv.created_by == sender {
+        let identities = self.conversation_identities.read().await;
+        for (id, identity) in identities.iter() {
+            if identity.agent == agent && identity.created_by == sender {
                 return Some(*id);
             }
         }
@@ -171,6 +186,12 @@ impl<C: Config> Runtime<C> {
         let dest_conversations = dest.conversations.get_mut();
         for (id, conversation) in conversations.iter() {
             dest_conversations.insert(*id, conversation.clone());
+        }
+        // Transfer identity index as well.
+        let identities = self.conversation_identities.read().await;
+        let dest_identities = dest.conversation_identities.get_mut();
+        for (id, identity) in identities.iter() {
+            dest_identities.insert(*id, identity.clone());
         }
         let next = self.next_conversation_id.load(Ordering::Relaxed);
         dest.next_conversation_id.store(next, Ordering::Relaxed);

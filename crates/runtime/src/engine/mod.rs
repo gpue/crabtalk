@@ -24,6 +24,14 @@ use wcore::{Agent, ToolRegistry, model::Model};
 /// back as the replayed prefix.
 pub type SharedMemory = Arc<parking_lot::RwLock<Memory>>;
 
+/// Immutable identity fields for a conversation, stored outside the
+/// conversation mutex so they can be read without locking.
+#[derive(Debug, Clone)]
+pub struct ConversationIdentity {
+    pub agent: String,
+    pub created_by: String,
+}
+
 /// The crabtalk runtime.
 pub struct Runtime<C: Config> {
     pub model: Model<C::Provider>,
@@ -33,6 +41,9 @@ pub struct Runtime<C: Config> {
     agents: parking_lot::RwLock<BTreeMap<String, Agent<C::Provider>>>,
     ephemeral_agents: RwLock<BTreeMap<String, Agent<C::Provider>>>,
     conversations: RwLock<BTreeMap<u64, Arc<Mutex<Conversation>>>>,
+    /// Lock-free index of conversation identities for lookup without
+    /// acquiring conversation mutexes (avoids deadlock with active streams).
+    conversation_identities: RwLock<BTreeMap<u64, ConversationIdentity>>,
     next_conversation_id: AtomicU64,
     pub tools: ToolRegistry,
     steering: RwLock<BTreeMap<u64, watch::Sender<Option<String>>>>,
@@ -55,6 +66,7 @@ impl<C: Config> Runtime<C> {
             agents: parking_lot::RwLock::new(BTreeMap::new()),
             ephemeral_agents: RwLock::new(BTreeMap::new()),
             conversations: RwLock::new(BTreeMap::new()),
+            conversation_identities: RwLock::new(BTreeMap::new()),
             next_conversation_id: AtomicU64::new(1),
             tools,
             steering: RwLock::new(BTreeMap::new()),
